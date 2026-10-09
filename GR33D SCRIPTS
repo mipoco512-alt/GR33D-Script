@@ -1,0 +1,3746 @@
+-- GR33D Panel v7.11: swept hazard prediction, persistent chase evasion, runtime recovery
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CollectionService = game:GetService("CollectionService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+if not player then
+    warn("[GR33D] Run this as a LocalScript, not a server Script.")
+    return
+end
+local playerGui = player:WaitForChild("PlayerGui", 10)
+if not playerGui then
+    warn("[GR33D] PlayerGui was not available; panel was not started.")
+    return
+end
+
+-- LocalScript utilities for games you control. Server physics/damage remains authoritative.
+local Config = {
+    ScanInterval = 0.06, -- ~16 scans/second; HP response is immediate via HealthChanged
+    HazardScanInterval = 0.035, -- protection also runs before local physics
+    HazardMotionMaxAge = 0.25,
+    HazardSweepMemory = 0.14,
+    HazardMaxSampleSpeed = 3000,
+    HazardMaxAcceleration = 450,
+    HazardAccelerationHorizon = 0.35,
+    HazardPredictionSteps = 6,
+    UrgentImpactTime = 0.22,
+    UrgentRelocateCooldown = 0.08,
+    IndexBatchSize = 120,
+    UseHazardNameHints = true, -- only moving, on-course projectiles; names alone never cause a dodge
+    UseNPCNameHints = true,
+    NPCNameHints = {"worm", "sandworm", "deathworm", "giantworm", "wormmonster",
+        "enemy", "monster", "zombie", "killer", "hunter", "chaser", "boss"},
+    EscapeMinDuration = 1.7,
+    EscapeCooldown = 1.35,
+    ReturnSafeGrace = 0.65,
+    EscapeHeight = 14,
+    MaxEscapeDistance = 65,
+    -- Emergency tier: react to small real HP drops, or strongly abnormal
+    -- motion/grabbing of nearby hazard parts. Keep normal small dodges separate.
+    EmergencyHeight = 100,
+    EmergencyMinDuration = 3.5,
+    EmergencyReturnQuiet = 2.6,
+    EmergencyRetriggerCooldown = 0.45,
+    EmergencyGuardRadius = 34,
+    EmergencyProactiveRadiusCap = 45, -- ignore giant name-based danger radii
+    EmergencyFastThreatSpeed = 65,
+    EmergencySpinThreshold = 18,
+    EmergencyDirectionChangeSpeed = 25,
+    EmergencyDamageFraction = 0.001,
+    EmergencyDamageAbsolute = 0.05, -- 0.05 HP or less is enough on default health
+    EmergencyMinDamageThreshold = 0.025, -- filter numerical jitter
+    DamageBurstWindow = 0.7,
+    DamageBurstCount = 2,
+    EmergencyHomeDangerHold = 1.4,
+    ShieldDiameter = 8,
+    ChaseRelocateCooldown = 0.28, -- do not spin around every scan frame
+    ChaseGuardRadius = 27,
+    ChaseQuietWindow = 1.1,
+    ChaseReturnQuiet = 4,
+    ChaseHistoryDuration = 8,
+    ChaseHistorySize = 10,
+    ChaseMaxHeight = 650,
+    ChaseMaxHorizontalDistance = 800,
+    EscapeHoldResponsiveness = 150,
+    EscapeHoldMaxVelocity = 420,
+    EscapeDriftCorrection = 13,
+    ManualRearmDelay = 0.35,
+    ManualTeleportLiftSteps = {0, 1.5, 3, 5, 8, 12, 18, 25},
+    HazardMargin = 2.5,
+    ProjectileSpeedThreshold = 9,
+    PredictionSeconds = 1.0,
+    FlingLinearThreshold = 72, -- ordinary movement still permitted up to Run Speed + margin
+    FlingAngularThreshold = 20,
+    FlingRecoveryCooldown = 0.05, -- rate-limit notices, not actual protection
+    FlingImpulseDeltaThreshold = 26, -- suspicious single-step speed change (studs/s)
+    FlingFrameDistance = 5.5, -- unusually large displacement in one simulation step
+    FlingStationaryMaxSpeed = 4.5,
+    FlingStationaryMaxVertical = 7,
+    FlingGroundSnapshotAge = 0.55,
+    FlingInputReleaseGrace = 0.30,
+    SafePositionMaxAge = 3,
+    FallSpeedLimit = 45,
+    FlightSpeed = 50,
+    FlightMaxForce = 100000,
+    MinRunSpeed = 5,
+    MaxRunSpeed = 200,
+    DoubleTapWindow = 0.35,
+    NPCStartDistance = 45,
+    NPCStopDistance = 65,
+    NPCLiftHeight = 100,
+    NPCClearanceHeight = 35,
+    NPCLiftCooldown = 0.25,
+    NPCMinHoverDuration = 1.5,
+    NPCQuietTime = 1.0,
+    NPCLandingDepth = 1200,
+    AimRange = 600,
+    AimRadiusPixels = 320,
+    AimResponse = 18,
+    AimScanInterval = 0.10,
+    BulletRange = 1500,
+    BulletSpeed = 300,
+    BulletLifetime = 8,
+    BulletMaxTravel = 6000,
+    IdleSettleTime = 0.55,
+    IdleSettleRadius = 1.8, -- small rig/physics jitter does not reset the idle timer
+    IdleMaxHorizontalSpeed = 4.5,
+    IdleInputGrace = 0.28,
+    IdleMovingPlatformSpeed = 1.25,
+    AFKPulsingInterval = 18,
+    AFKPulsingDuration = 0.16,
+    AFKMovementPulse = 0.025,
+    -- Broad 'Disaster'/'Volcano' labels do NOT imply an imminent impact.
+    HazardTags = {"ProtectionHazard", "Hazard", "Disaster", "Nuke", "NuclearMissile",
+        "Tsunami", "TsunamiWave", "Lightning", "C4Bomb", "Volcano", "Meteor",
+        "Deadzone", "Killzone", "Explosion", "Bomb", "Trap", "Lava"},
+    ConfirmedHazardTags = {"ProtectionHazard", "Nuke", "NuclearMissile", "TsunamiWave",
+        "Lightning", "C4Bomb", "Meteor", "Deadzone", "Killzone", "Explosion",
+        "Bomb", "Trap", "Lava"},
+    -- These names identify candidate *parts*, not lethal proof or a damage radius.
+    ProjectileHints = {"magma", "lava", "meteor", "meteorite", "missile", "nuclearmissile",
+        "nuke", "nuclear", "rocket", "grenade", "bomb", "comet", "asteroid", "lightning",
+        "fireball", "acid", "tsunamiwave", "warhead"},
+    HostileTags = {"Hostile", "Enemy", "Monster", "NPC_Hostile", "Chaser", "Boss", "Zombie"},
+    FriendlyTags = {"Friendly", "Neutral", "Passive", "NonHostile", "ProtectionIgnore"},
+    HazardAttributes = {"Damage", "DamageAmount", "Hazard", "KillZone", "IsDisaster",
+        "Dangerous", "Lethal", "Kill", "Deadly", "Explosive"},
+}
+
+-- All state exists before callbacks capture it.
+local S = {
+    alive = true, context = nil, setupToken = 0, connections = {}, characterConnections = {},
+    watchers = {}, hazards = {}, motion = {}, npcs = {}, pending = {}, pendingIndex = 1,
+    hazardCache = nil, hazardCacheAt = -math.huge, hazardErrors = {},
+    lastProtectionScanAt = -math.huge, escapeHistory = {},
+    properties = {}, states = {}, flags = {}, switches = {}, ui = {}, cameraConnection = nil,
+    controls = nil, runSpeed = 50, flying = false, hovering = false, mover = nil,
+    lockTarget = nil, escape = nil, lastEscape = -math.huge, idleTarget = nil,
+    idleSince = nil, idleSample = nil, idleBlockedUntil = -math.huge,
+    afkLastPulse = os.clock(), afkPulseUntil = nil, afkPostPulseUntil = -math.huge,
+    safeRoot = nil, safeTime = -math.huge, hoverY = nil,
+    hoverStartedAt = nil, hoverQuietSince = nil, lastNPCLift = -math.huge,
+    aimTarget = nil, aimBound = false, lastAimScan = -math.huge,
+    aimBinding = "GR33D_Aim_" .. tostring(player.UserId),
+    guidedBullets = {}, weaponHooks = {},
+    lastDrop = -math.huge, previousHealth = nil, healing = false, lastJump = -math.huge,
+    lastJumpRequest = -math.huge, scanClock = 0, notice = "Client panel ready", noticeUntil = 0,
+    savedLocation = (typeof(player:GetAttribute("GR33D_SavedLocation")) == "CFrame"
+        and player:GetAttribute("GR33D_SavedLocation") or nil), entrySpawn = nil, joinSpawn = nil,
+    lastDamageAt = -math.huge, damageEvents = {}, lastSevereThreatAt = -math.huge,
+    lastEmergency = -math.huge, homeThreatAt = -math.huge,
+    lastFlingRecovery = -math.huge,
+    flingHoldTarget = nil, flingPauseUntil = -math.huge, flingInputUntil = -math.huge,
+    flingSnapshot = nil, flingLastStableCF = nil, flingLastStableAt = -math.huge,
+    flingRecovering = false,
+    lockSuspended = false, escapeHold = nil, lastEscapeDriftCorrection = -math.huge,
+    lastChaseRelocate = -math.huge, lastChaseThreatAt = -math.huge,
+    impactEntries = {}, recentHazard = nil,
+    minimized = false, dragging = nil, suppressMinimizeUntil = -math.huge,
+}
+local H = {}
+for _, key in ipairs({"flight", "health", "fall", "noclip", "fling", "trap", "run", "jump", "lock", "monster", "afk", "aim", "bullet"}) do
+    S.flags[key] = false
+end
+
+function H.finite(number)
+    return type(number) == "number" and number == number and math.abs(number) < math.huge
+end
+
+function H.finiteVector(vector)
+    return typeof(vector) == "Vector3" and H.finite(vector.X) and H.finite(vector.Y) and H.finite(vector.Z)
+end
+
+function H.connect(signal, callback, bucket)
+    local connection = signal:Connect(callback)
+    table.insert(bucket or S.connections, connection)
+    return connection
+end
+
+function H.disconnectAll(bucket)
+    for _, connection in ipairs(bucket) do
+        local ok, message = pcall(function() connection:Disconnect() end)
+        if not ok then H.report("Disconnect callback", message) end
+    end
+    for i = #bucket, 1, -1 do bucket[i] = nil end
+end
+
+function H.notice(message, duration)
+    S.notice = message
+    S.noticeUntil = os.clock() + (duration or 3)
+end
+
+function H.report(label, message)
+    warn("[GR33D] " .. label .. ": " .. tostring(message))
+    H.notice(label .. " failed; see Output", 5)
+end
+
+function H.ready()
+    local ctx = S.context
+    return S.alive and ctx ~= nil and player.Character == ctx.character
+        and ctx.character:IsDescendantOf(Workspace) and ctx.root:IsDescendantOf(ctx.character)
+        and ctx.humanoid:IsDescendantOf(ctx.character) and ctx.humanoid.Health > 0
+end
+
+-- Property leases allow noclip + hover to share CanCollide without bad restores.
+function H.claim(instance, property, value, owner)
+    local fields = S.properties[instance]
+    if not fields then fields = {}; S.properties[instance] = fields end
+    local entry = fields[property]
+    if not entry then
+        entry = {original = instance[property], owners = {}}
+        fields[property] = entry
+    end
+    entry.owners[owner] = true
+    if instance[property] ~= value then instance[property] = value end
+end
+
+function H.claimState(humanoid, state, enabled, owner)
+    local fields = S.states[humanoid]
+    if not fields then fields = {}; S.states[humanoid] = fields end
+    local entry = fields[state]
+    if not entry then
+        entry = {original = humanoid:GetStateEnabled(state), owners = {}}
+        fields[state] = entry
+    end
+    entry.owners[owner] = true
+    if humanoid:GetStateEnabled(state) ~= enabled then humanoid:SetStateEnabled(state, enabled) end
+end
+
+function H.release(owner)
+    for instance, fields in pairs(S.properties) do
+        for property, entry in pairs(fields) do
+            if entry.owners[owner] then
+                entry.owners[owner] = nil
+                if next(entry.owners) == nil then
+                    local ok, message = pcall(function() instance[property] = entry.original end)
+                    if not ok and instance.Parent then H.report("Restore " .. property, message) end
+                    fields[property] = nil
+                end
+            end
+        end
+        if next(fields) == nil then S.properties[instance] = nil end
+    end
+    for humanoid, fields in pairs(S.states) do
+        for state, entry in pairs(fields) do
+            if entry.owners[owner] then
+                entry.owners[owner] = nil
+                if next(entry.owners) == nil then
+                    local ok, message = pcall(function() humanoid:SetStateEnabled(state, entry.original) end)
+                    if not ok and humanoid.Parent then H.report("Restore humanoid state", message) end
+                    fields[state] = nil
+                end
+            end
+        end
+        if next(fields) == nil then S.states[humanoid] = nil end
+    end
+end
+
+function H.releaseAll()
+    local owners = {}
+    for _, fields in pairs(S.properties) do
+        for _, entry in pairs(fields) do
+            for owner in pairs(entry.owners) do owners[owner] = true end
+        end
+    end
+    for _, fields in pairs(S.states) do
+        for _, entry in pairs(fields) do
+            for owner in pairs(entry.owners) do owners[owner] = true end
+        end
+    end
+    for owner in pairs(owners) do H.release(owner) end
+end
+
+-- Standalone LocalScript. This cannot override authoritative server collision/damage.
+
+function H.zeroVelocity()
+    if S.context then
+        S.context.root.AssemblyLinearVelocity = Vector3.zero
+        S.context.root.AssemblyAngularVelocity = Vector3.zero
+    end
+end
+
+function H.moveRoot(target)
+    if not H.ready() or not H.finiteVector(target.Position) then return false end
+    local ctx = S.context
+    -- PivotTo takes a MODEL pivot, not necessarily the HumanoidRootPart CFrame.
+    local rootToPivot = ctx.root.CFrame:ToObjectSpace(ctx.character:GetPivot())
+    ctx.character:PivotTo(target * rootToPivot)
+    H.zeroVelocity()
+    H.resetRunObservation()
+    return true
+end
+
+function H.tokens(name)
+    local tokens = {}
+    local splitName = name:gsub("(%l)(%u)", "%1 %2"):lower()
+    for word in splitName:gmatch("%w+") do tokens[word] = true end
+    tokens[name:lower():gsub("[^%w]", "")] = true
+    return tokens
+end
+
+function H.projectileNameHint(name)
+    if not Config.UseHazardNameHints then return false end
+    local tokens = H.tokens(name)
+    for _, word in ipairs(Config.ProjectileHints) do
+        if tokens[word] then return true end
+    end
+    return false
+end
+
+function H.hasTag(instance, tags)
+    for _, tag in ipairs(tags) do
+        if CollectionService:HasTag(instance, tag) then return true end
+    end
+    return false
+end
+
+-- Ignore ordinary avatar limbs and accessories, but not genuinely hazardous
+-- objects temporarily held by another player (e.g. an equipped nuclear tool).
+function H.ignored(instance)
+    if player.Character and instance:IsDescendantOf(player.Character) then return true end
+    local nominated = H.projectileNameHint(instance.Name)
+        or H.hasTag(instance, Config.ConfirmedHazardTags)
+        or instance:GetAttribute("Lethal") == true
+        or instance:GetAttribute("KillZone") == true
+        or (H.finite(instance:GetAttribute("Damage")) and instance:GetAttribute("Damage") > 0)
+        or (H.finite(instance:GetAttribute("DamageAmount")) and instance:GetAttribute("DamageAmount") > 0)
+    local current = instance
+    while current and current ~= Workspace do
+        if current:GetAttribute("ProtectionIgnore") == true
+            or CollectionService:HasTag(current, "ProtectionIgnore") then return true end
+        if current:IsA("Accessory") then return true end
+        if H.projectileNameHint(current.Name)
+            or H.hasTag(current, Config.ConfirmedHazardTags)
+            or current:GetAttribute("Lethal") == true
+            or current:GetAttribute("KillZone") == true
+            or (H.finite(current:GetAttribute("Damage")) and current:GetAttribute("Damage") > 0)
+            or (H.finite(current:GetAttribute("DamageAmount")) and current:GetAttribute("DamageAmount") > 0) then
+            nominated = true
+        end
+        if current:IsA("Tool") or (current:IsA("Model") and Players:GetPlayerFromCharacter(current)) then
+            if not nominated then return true end
+        end
+        current = current.Parent
+    end
+    return false
+end
+
+function H.projectileHintInTree(instance)
+    local current = instance
+    while current and current ~= Workspace do
+        if H.projectileNameHint(current.Name) then return true end
+        current = current.Parent
+    end
+    return false
+end
+
+function H.grabEvidence(instance)
+    local current = instance
+    while current and current ~= Workspace do
+        for _, attribute in ipairs({"IsGrabbed", "Grabbed", "IsHeld", "Held", "BeingCarried"}) do
+            if current:GetAttribute(attribute) == true then return true end
+        end
+        for _, attribute in ipairs({"GrabbedBy", "HeldBy", "CarriedBy"}) do
+            local value = current:GetAttribute(attribute)
+            if value ~= nil and value ~= false and value ~= "" and value ~= 0 then return true end
+        end
+        if current:IsA("Tool") and current.Parent
+            and current.Parent:IsA("Model")
+            and Players:GetPlayerFromCharacter(current.Parent) then return true end
+        current = current.Parent
+    end
+    return false
+end
+
+-- A danger label is only a *candidate*. Dodge requires a real contact / predicted impact.
+function H.hazardInfo(instance)
+    if not instance.Parent or not instance:IsDescendantOf(Workspace) or H.ignored(instance) then return nil end
+    if not (instance:IsA("BasePart") or instance:IsA("Model") or instance:IsA("Explosion")) then return nil end
+
+    local confirmed, explicitlyActive, inactive = instance:IsA("Explosion"), false, false
+    local radius = 0
+    local activeRadius
+    local cur = instance
+    while cur and cur ~= Workspace do
+        for _, attr in ipairs({"Active", "IsActive", "Armed"}) do
+            local value = cur:GetAttribute(attr)
+            if value == false then inactive = true end
+            if value == true then explicitlyActive = true end
+        end
+        for _, attr in ipairs({"Damage", "DamageAmount"}) do
+            local value = cur:GetAttribute(attr)
+            if H.finite(value) and value > 0 then confirmed = true end
+        end
+        for _, attr in ipairs({"Lethal", "KillZone", "Kill", "Deadly"}) do
+            if cur:GetAttribute(attr) == true then confirmed = true end
+        end
+        if H.hasTag(cur, Config.ConfirmedHazardTags) then confirmed = true end
+        if activeRadius == nil then
+            for _, attr in ipairs({"HazardRadius", "DangerRadius", "BlastRadius", "ExplosionRadius", "DamageRadius"}) do
+                local requested = cur:GetAttribute(attr)
+                if H.finite(requested) and requested >= 0 then
+                    activeRadius = math.clamp(requested, 0, 500)
+                    break
+                end
+            end
+        end
+        cur = cur.Parent
+    end
+    if inactive then return nil end
+
+    local bounds, size, part
+    if instance:IsA("BasePart") then
+        bounds, size, part = instance.CFrame, instance.Size, instance
+    elseif instance:IsA("Model") then
+        part = instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart", true)
+        if not part then return nil end
+        bounds, size = instance:GetBoundingBox()
+    else
+        bounds, size = CFrame.new(instance.Position), Vector3.zero
+        radius = math.max(0, instance.BlastRadius)
+    end
+    if not H.finiteVector(bounds.Position) or not H.finiteVector(size)
+        or not H.finite(radius) then return nil end
+
+    -- Tweened projectiles may report zero physics velocity, so sample their motion too.
+    local velocity = part and part.AssemblyLinearVelocity or Vector3.zero
+    if not H.finiteVector(velocity) then velocity = Vector3.zero end
+    local now = os.clock()
+    local previous = S.motion[instance]
+    local sampledVelocity, acceleration = Vector3.zero, Vector3.zero
+    local sampledAngularSpeed = 0
+    local abruptReversal, teleported = false, false
+    local sweptFrom, sweptAt
+    if previous and now - previous.time >= Config.HazardScanInterval * 0.7 then
+        local elapsed = now - previous.time
+        if elapsed <= Config.HazardMotionMaxAge then
+            local displacement = bounds.Position - previous.position
+            sampledVelocity = displacement / elapsed
+            if previous.bounds then
+                local trace = previous.bounds.RightVector:Dot(bounds.RightVector)
+                    + previous.bounds.UpVector:Dot(bounds.UpVector)
+                    + previous.bounds.LookVector:Dot(bounds.LookVector)
+                sampledAngularSpeed = math.acos(math.clamp((trace - 1) * 0.5, -1, 1)) / elapsed
+                if not H.finite(sampledAngularSpeed) then sampledAngularSpeed = 0 end
+            end
+            if H.finiteVector(sampledVelocity) then
+                teleported = displacement.Magnitude > math.max(12, velocity.Magnitude * elapsed * 2 + 6)
+                if sampledVelocity.Magnitude > Config.HazardMaxSampleSpeed then
+                    sampledVelocity = sampledVelocity.Unit * Config.HazardMaxSampleSpeed
+                end
+                if displacement.Magnitude > 0.05 then sweptFrom, sweptAt = previous.position, now end
+                local before = previous.velocity
+                if before.Magnitude >= Config.EmergencyDirectionChangeSpeed
+                    and sampledVelocity.Magnitude >= Config.EmergencyDirectionChangeSpeed then
+                    abruptReversal = before.Unit:Dot(sampledVelocity.Unit) < -0.2
+                end
+                -- Use acceleration only after two consistent moving samples.
+                -- A teleport/reversal is evidence to evade, not a ballistic orbit.
+                if previous.sampled and not teleported and not abruptReversal
+                    and before.Magnitude >= Config.ProjectileSpeedThreshold
+                    and sampledVelocity.Magnitude >= Config.ProjectileSpeedThreshold then
+                    acceleration = (sampledVelocity - before) / elapsed
+                    if not H.finiteVector(acceleration) then acceleration = Vector3.zero end
+                    if acceleration.Magnitude > Config.HazardMaxAcceleration then
+                        acceleration = acceleration.Unit * Config.HazardMaxAcceleration
+                    end
+                end
+            else sampledVelocity = Vector3.zero end
+        end
+        S.motion[instance] = {position = bounds.Position, bounds = bounds, time = now,
+            velocity = sampledVelocity, acceleration = acceleration, sampled = true,
+            angularSpeed = sampledAngularSpeed,
+            reversedAt = abruptReversal and now or previous.reversedAt,
+            teleportedAt = teleported and now or previous.teleportedAt,
+            sweptFrom = sweptFrom, sweptAt = sweptAt, lastMovingAt = previous.lastMovingAt}
+    elseif not previous then
+        S.motion[instance] = {position = bounds.Position, bounds = bounds, time = now,
+            velocity = Vector3.zero, acceleration = Vector3.zero, reversedAt = -math.huge,
+            angularSpeed = 0, teleportedAt = -math.huge}
+    else
+        sampledVelocity = previous.velocity
+        acceleration = previous.acceleration or Vector3.zero
+        sampledAngularSpeed = previous.angularSpeed or 0
+        sweptFrom, sweptAt = previous.sweptFrom, previous.sweptAt
+    end
+    local motion = S.motion[instance]
+    abruptReversal = abruptReversal or (motion and motion.reversedAt
+        and now - motion.reversedAt < 0.18) or false
+    teleported = teleported or (motion and motion.teleportedAt
+        and now - motion.teleportedAt < Config.HazardSweepMemory) or false
+    -- Prefer measured CFrame motion when physics velocity is missing or points
+    -- the other way. A faster stale physics vector must not mask a reversal.
+    if part and part.Anchored then
+        -- Anchored parts can only move through CFrame/tweens. Their retained
+        -- AssemblyLinearVelocity is not evidence that they are still moving.
+        velocity = sampledVelocity
+    elseif H.finiteVector(sampledVelocity) and (sampledVelocity.Magnitude > velocity.Magnitude
+        or (sampledVelocity.Magnitude >= Config.ProjectileSpeedThreshold
+            and sampledVelocity:Dot(velocity) < 0)) then
+        velocity = sampledVelocity
+    end
+
+    local angular = part and part.AssemblyAngularVelocity or Vector3.zero
+    if not H.finiteVector(angular) then angular = Vector3.zero end
+    local angularSpeed = part and part.Anchored and sampledAngularSpeed
+        or math.max(angular.Magnitude, sampledAngularSpeed)
+    local spinning = angularSpeed >= Config.EmergencySpinThreshold
+    local moving = velocity.Magnitude >= Config.ProjectileSpeedThreshold
+    if moving or spinning then motion.lastMovingAt = now end
+    local recentlyMoved = now - (motion.lastMovingAt or -math.huge) < 0.75
+    local hinted = instance:IsA("BasePart") and H.projectileHintInTree(instance)
+    -- An ordinary named / static decoration should NEVER trigger the escape system.
+    if not confirmed and not (hinted and (moving or spinning or recentlyMoved
+        or explicitlyActive or H.grabEvidence(instance))) then return nil end
+    -- Tags on large *container models* are often scenery: only explicitly marked
+    -- regions/models qualify, and movement is evaluated using their own bounding box.
+    if instance:IsA("Model") and not (instance:GetAttribute("Lethal") == true
+        or instance:GetAttribute("KillZone") == true
+        or instance:GetAttribute("HazardRadius") ~= nil
+        or H.hasTag(instance, Config.ConfirmedHazardTags)) then return nil end
+
+    if activeRadius ~= nil then
+        radius = instance:IsA("Explosion") and math.max(radius, activeRadius) or activeRadius
+    end
+    return {instance = instance, name = instance.Name, bounds = bounds, size = size,
+        velocity = velocity, angularSpeed = angularSpeed,
+        acceleration = acceleration, sweptFrom = sweptFrom, sweptAt = sweptAt,
+        moving = moving, spinning = spinning, recentlyMoved = recentlyMoved,
+        active = explicitlyActive, radius = radius, grabbed = H.grabEvidence(instance),
+        erratic = abruptReversal, teleported = teleported,
+        explosion = instance:IsA("Explosion"), explicit = confirmed}
+end
+
+function H.boxDistance(position, bounds, size)
+    local offset = bounds:PointToObjectSpace(position)
+    local half = size * 0.5
+    return Vector3.new(math.max(0, math.abs(offset.X) - half.X),
+        math.max(0, math.abs(offset.Y) - half.Y), math.max(0, math.abs(offset.Z) - half.Z)).Magnitude
+end
+
+-- Intersect a relative-motion segment with an expanded oriented box. Checking
+-- only closest approach to the CENTER misses elongated projectiles.
+function H.sweptBoxTime(bounds, size, startPoint, displacement, padding)
+    local start = bounds:PointToObjectSpace(startPoint)
+    local finish = bounds:PointToObjectSpace(startPoint + displacement)
+    local change = finish - start
+    local half = size * 0.5 + Vector3.new(padding, padding, padding)
+    local first, last = 0, 1
+    for _, axis in ipairs({"X", "Y", "Z"}) do
+        local value, delta, extent = start[axis], change[axis], half[axis]
+        if math.abs(delta) < 1e-8 then
+            if math.abs(value) > extent then return nil end
+        else
+            local a, b = (-extent - value) / delta, (extent - value) / delta
+            if a > b then a, b = b, a end
+            first, last = math.max(first, a), math.min(last, b)
+            if first > last then return nil end
+        end
+    end
+    return first
+end
+
+-- Exact segment-to-box distance for destination ranking. Uniform time samples
+-- can look safe on both sides of a very fast projectile passing between them.
+function H.segmentBoxDistance(bounds, size, startPoint, displacement)
+    local start = bounds:PointToObjectSpace(startPoint)
+    local delta = bounds:PointToObjectSpace(startPoint + displacement) - start
+    local half = size * 0.5
+    local cuts = {0, 1}
+    for _, axis in ipairs({"X", "Y", "Z"}) do
+        if math.abs(delta[axis]) > 1e-8 then
+            for _, extent in ipairs({-half[axis], half[axis]}) do
+                local time = (extent - start[axis]) / delta[axis]
+                if time > 0 and time < 1 then table.insert(cuts, time) end
+            end
+        end
+    end
+    table.sort(cuts)
+    local best = math.huge
+    for index = 1, #cuts - 1 do
+        local first, last = cuts[index], cuts[index + 1]
+        local midpoint = (first + last) * 0.5
+        local ab, bb = 0, 0
+        for _, axis in ipairs({"X", "Y", "Z"}) do
+            local value = start[axis] + delta[axis] * midpoint
+            if math.abs(value) > half[axis] then
+                local offset = start[axis] - (value > 0 and half[axis] or -half[axis])
+                ab += offset * delta[axis]
+                bb += delta[axis] * delta[axis]
+            end
+        end
+        local time = bb > 1e-8 and math.clamp(-ab / bb, first, last) or midpoint
+        local point = start + delta * time
+        local squared = 0
+        for _, axis in ipairs({"X", "Y", "Z"}) do
+            local outside = math.max(0, math.abs(point[axis]) - half[axis])
+            squared += outside * outside
+        end
+        best = math.min(best, squared)
+    end
+    return math.sqrt(best)
+end
+
+function H.hazardAccelerationOffset(info, time)
+    local duration = math.min(time, Config.HazardAccelerationHorizon)
+    -- Continue the acquired velocity after a short acceleration horizon.
+    return (info.acceleration or Vector3.zero) * (duration * (time - duration * 0.5))
+end
+
+function H.threatAt(info, position, observerVelocity, includeSweep)
+    observerVelocity = observerVelocity or Vector3.zero
+    local distance = H.boxDistance(position, info.bounds, info.size)
+    local required = info.radius + Config.HazardMargin
+    if info.explosion then
+        return distance <= required, distance, 0
+    end
+    -- Recent CFrame jumps can cross the player between physics samples. Do not
+    -- reject future destinations because a hazard USED to cross that point.
+    if includeSweep ~= false and info.sweptFrom and info.sweptAt
+        and os.clock() - info.sweptAt <= Config.HazardSweepMemory then
+        local priorBounds = info.bounds + (info.sweptFrom - info.bounds.Position)
+        if H.sweptBoxTime(priorBounds, info.size, position,
+            info.sweptFrom - info.bounds.Position, required) then
+            return true, 0, 0
+        end
+    end
+    if not (info.moving or info.explicit or info.grabbed or info.spinning
+        or info.active or info.recentlyMoved) then return false, distance, 0 end
+    if distance <= required then return true, distance, 0 end
+    local spinPadding = math.min(8, (info.angularSpeed or 0) * info.size.Magnitude * 0.025)
+    local velocity = info.moving and info.velocity or Vector3.zero
+    local miss = distance
+    local steps = (info.acceleration or Vector3.zero).Magnitude > 1 and Config.HazardPredictionSteps or 1
+    local from, fromTime = position, 0
+    for step = 1, steps do
+        local time = Config.PredictionSeconds * step / steps
+        local relative = position + (observerVelocity - velocity) * time
+            - H.hazardAccelerationOffset(info, time)
+        local entry = H.sweptBoxTime(info.bounds, info.size, from, relative - from, required + spinPadding)
+        miss = math.min(miss, H.boxDistance(relative, info.bounds, info.size))
+        if entry then
+            local contact = from + (relative - from) * entry
+            return true, H.boxDistance(contact, info.bounds, info.size), fromTime + (time - fromTime) * entry
+        end
+        from, fromTime = relative, time
+    end
+    return false, miss, Config.PredictionSeconds
+end
+
+function H.hazardCandidate(instance)
+    if H.ignored(instance) then return false end
+    if instance:IsA("Explosion") then return true end
+    if instance:IsA("BasePart") and H.projectileHintInTree(instance) then return true end
+    if not (instance:IsA("BasePart") or instance:IsA("Model")) then return false end
+    local cur = instance
+    while cur and cur ~= Workspace do
+        if H.hasTag(cur, Config.ConfirmedHazardTags) then return true end
+        for _, attr in ipairs({"Damage", "DamageAmount", "Lethal", "KillZone", "Kill", "Deadly"}) do
+            local value = cur:GetAttribute(attr)
+            if value == true or (H.finite(value) and value > 0) then return true end
+        end
+        cur = cur.Parent
+    end
+    return false
+end
+
+function H.hazardSnapshot()
+    local now = os.clock()
+    if S.hazardCache and now - S.hazardCacheAt < Config.HazardScanInterval then return S.hazardCache end
+    local records = {}
+    for instance in pairs(S.hazards) do
+        if not instance.Parent or not instance:IsDescendantOf(Workspace) then
+            S.hazards[instance], S.motion[instance], S.hazardErrors[instance] = nil, nil, nil
+        else
+            local ok, info = pcall(H.hazardInfo, instance)
+            if ok then
+                if info then table.insert(records, info) end
+                S.hazardErrors[instance] = nil
+            elseif now - (S.hazardErrors[instance] or -math.huge) >= 5 then
+                S.hazardErrors[instance] = now
+                H.report("Hazard sample " .. instance.Name, info)
+            end
+        end
+    end
+    S.hazardCache, S.hazardCacheAt = records, now
+    return records
+end
+
+function H.findHazard(position, observerVelocity, includeSweep)
+    local best, soonest, bestDistance = nil, math.huge, math.huge
+    for _, info in ipairs(H.hazardSnapshot()) do
+            local danger, distance, t = H.threatAt(info, position, observerVelocity, includeSweep)
+            if danger and (t < soonest or (t == soonest and distance < bestDistance)) then
+                best, soonest, bestDistance = table.clone(info), t, distance
+                best.distance, best.impactTime = distance, t
+            end
+    end
+    return best
+end
+
+function H.enemyMetadata(instance, names)
+    local folders = Config.EnemyMetadataFolders
+        or {"AI", "Config", "Configuration", "Stats", "Status", "Metadata", "Combat", "Data"}
+    for _, name in ipairs(names) do
+        local attribute = instance:GetAttribute(name)
+        if attribute ~= nil then return attribute end
+        local child = instance:FindFirstChild(name)
+        if child and (child:IsA("BoolValue") or child:IsA("StringValue")
+            or child:IsA("NumberValue") or child:IsA("IntValue") or child:IsA("ObjectValue")) then
+            if child.Value ~= nil then return child.Value end
+        end
+        for _, folderName in ipairs(folders) do
+            local folder = instance:FindFirstChild(folderName)
+            local value = folder and folder:FindFirstChild(name)
+            if value and (value:IsA("BoolValue") or value:IsA("StringValue")
+                or value:IsA("NumberValue") or value:IsA("IntValue") or value:IsA("ObjectValue")) then
+                if value.Value ~= nil then return value.Value end
+            end
+        end
+    end
+    return nil
+end
+
+function H.enemyWord(value)
+    return type(value) == "string" and value:lower():gsub("[^%w]", "") or nil
+end
+
+function H.enemyFactionFriendly(instance)
+    local faction = H.enemyMetadata(instance, {"Faction", "FactionId", "Alliance", "AllianceId"})
+    local localFaction = H.enemyMetadata(player, {"Faction", "FactionId", "Alliance", "AllianceId"})
+    if localFaction == nil and S.context then
+        localFaction = H.enemyMetadata(S.context.character, {"Faction", "FactionId", "Alliance", "AllianceId"})
+    end
+    if faction ~= nil and localFaction ~= nil and faction ~= "" and localFaction ~= "" then
+        if type(faction) == "string" and type(localFaction) == "string" then
+            if faction:lower() == localFaction:lower() then return true end
+        elseif faction == localFaction then return true end
+    end
+    local team = H.enemyMetadata(instance, {"Team", "TeamId"})
+    if not player.Neutral and player.Team and team ~= nil then
+        if team == player.Team or team == player.Team.Name then return true end
+    end
+    return false
+end
+
+function H.enemyFriendly(instance)
+    if H.hasTag(instance, Config.FriendlyTags) or instance:GetAttribute("ProtectionIgnore") == true then return true end
+    for _, name in ipairs({"Friendly", "IsFriendly", "Neutral", "IsNeutral", "Passive", "NonHostile", "Ally", "IsAlly"}) do
+        if H.enemyMetadata(instance, {name}) == true then return true end
+    end
+    local friendly = {friendly = true, neutral = true, passive = true, ally = true,
+        allied = true, nonhostile = true, civilian = true}
+    for _, name in ipairs({"AIState", "State", "Disposition", "Alignment", "Attitude", "Faction"}) do
+        if friendly[H.enemyWord(H.enemyMetadata(instance, {name}))] then return true end
+    end
+    return H.enemyFactionFriendly(instance)
+end
+
+function H.enemyHealth(instance)
+    local value = H.enemyMetadata(instance, {"Health", "HP", "Hp", "HitPoints", "CurrentHealth"})
+    return H.finite(value) and value or nil
+end
+
+function H.enemyInactive(instance)
+    for _, name in ipairs({"Active", "IsActive", "Alive", "IsAlive"}) do
+        if H.enemyMetadata(instance, {name}) == false then return true end
+    end
+    for _, name in ipairs({"Dead", "IsDead", "Destroyed"}) do
+        if H.enemyMetadata(instance, {name}) == true then return true end
+    end
+    local humanoid = instance:IsA("Model") and instance:FindFirstChildOfClass("Humanoid") or nil
+    if humanoid and (not H.finite(humanoid.Health) or humanoid.Health <= 0) then return true end
+    local health = H.enemyHealth(instance)
+    return health ~= nil and health <= 0
+end
+
+function H.enemyTargeted(instance)
+    local ctx = S.context
+    for _, name in ipairs({"Target", "CurrentTarget", "AttackTarget", "Enemy", "TargetPlayer", "TargetCharacter", "TargetUserId"}) do
+        local target = H.enemyMetadata(instance, {name})
+        if target == player or (ctx and (target == ctx.character or target == ctx.root or target == ctx.humanoid)) then return true end
+        if typeof(target) == "Instance" and ctx and target:IsDescendantOf(ctx.character) then return true end
+        if type(target) == "number" and target == player.UserId then return true end
+        if type(target) == "string" and (target:lower() == player.Name:lower()
+            or target == tostring(player.UserId)) then return true end
+    end
+    return false
+end
+
+function H.enemyExplicitHostile(instance)
+    if H.hasTag(instance, Config.HostileTags) then return true end
+    for _, name in ipairs({"Hostile", "IsHostile", "IsEnemy", "Enemy", "Attacking", "Aggro", "Aggressive"}) do
+        if H.enemyMetadata(instance, {name}) == true then return true end
+    end
+    local hostile = {enemy = true, monster = true, attack = true, attacking = true,
+        chase = true, chasing = true, aggro = true, aggressive = true, hostile = true,
+        combat = true, hunting = true, huntingplayer = true}
+    for _, name in ipairs({"AIState", "State", "Behavior", "Behaviour", "Disposition", "Alignment", "Attitude", "Faction"}) do
+        if hostile[H.enemyWord(H.enemyMetadata(instance, {name}))] then return true end
+    end
+    return H.enemyTargeted(instance)
+end
+
+function H.enemyDamageable(instance)
+    if H.hasTag(instance, {"Damageable"}) then return true end
+    for _, name in ipairs({"Damageable", "IsDamageable", "CanTakeDamage", "CanBeDamaged"}) do
+        if H.enemyMetadata(instance, {name}) == true then return true end
+    end
+    local health = H.enemyHealth(instance)
+    return health ~= nil and health > 0
+end
+
+function H.watchEnemyMetadata(instance)
+    if not (instance:IsA("BoolValue") or instance:IsA("StringValue") or instance:IsA("NumberValue")
+        or instance:IsA("IntValue") or instance:IsA("ObjectValue")) then return false end
+    if not instance:IsDescendantOf(Workspace) then return true end
+    if S.watchers[instance] then H.refreshObject(instance); return true end
+    local connections = {}
+    S.watchers[instance] = connections
+    H.connect(instance:GetPropertyChangedSignal("Value"), function() H.refreshObject(instance) end, connections)
+    H.connect(instance:GetPropertyChangedSignal("Name"), function() H.refreshObject(instance) end, connections)
+    H.refreshObject(instance)
+    return true
+end
+
+function H.enemyOwner(instance)
+    if instance:IsA("Model") then return instance end
+    if not instance:IsA("BasePart") then return nil end
+    local current, fallback = instance.Parent, nil
+    while current and current ~= Workspace do
+        if current:IsA("Model") then
+            if current:FindFirstChildOfClass("Humanoid") or current:FindFirstChildOfClass("AnimationController")
+                or H.enemyDamageable(current) then return current end
+            -- Keep a real named/marked owning body; an arbitrary map model is
+            -- not the owner of a separately tagged, damageable monster part.
+            if not fallback and H.npcMarked(current) then fallback = current end
+        end
+        current = current.Parent
+    end
+    if H.enemyDamageable(instance) or H.npcMarked(instance) then return instance end
+    return fallback or instance
+end
+
+function H.enemyRoot(instance)
+    if instance:IsA("BasePart") then return instance end
+    if not instance:IsA("Model") then return nil end
+    local root = instance:FindFirstChild("HumanoidRootPart") or instance.PrimaryPart
+        or instance:FindFirstChild("Head") or instance:FindFirstChildWhichIsA("BasePart", true)
+    return root and root:IsA("BasePart") and root or nil
+end
+
+function H.enemyRecord(instance, origin, options)
+    options = options or {}
+    if not instance or typeof(origin) ~= "Vector3" or not H.finiteVector(origin) then return nil end
+    if instance:IsA("Player") then instance = instance.Character end
+    if not instance or not instance.Parent or not instance:IsDescendantOf(Workspace) then return nil end
+    if not (instance:IsA("Model") or instance:IsA("BasePart")) then return nil end
+    local targetPlayer = instance:IsA("Model") and Players:GetPlayerFromCharacter(instance) or nil
+    local humanoid = instance:IsA("Model") and instance:FindFirstChildOfClass("Humanoid") or nil
+    if targetPlayer then
+        if options.allowPlayers == false or targetPlayer == player or targetPlayer.Character ~= instance
+            or not humanoid or not H.finite(humanoid.Health) or humanoid.Health <= 0 then return nil end
+        -- Neutral FFA players can retain a Team reference; it is not a team assignment.
+        if not player.Neutral and not targetPlayer.Neutral and player.Team and targetPlayer.Team == player.Team then return nil end
+        if H.enemyFriendly(targetPlayer) or H.enemyInactive(targetPlayer) then return nil end
+        local current = instance
+        while current and current ~= Workspace do
+            if H.enemyFriendly(current) or H.enemyInactive(current) then return nil end
+            current = current.Parent
+        end
+    elseif not H.hostileNPC(instance) then return nil end
+    local root = H.enemyRoot(instance)
+    if not root or not root.Parent or not root:IsDescendantOf(Workspace) or not H.finiteVector(root.Position) then return nil end
+    if not targetPlayer and H.npcExcluded(root) then return nil end
+    local cameraEligible = humanoid ~= nil and H.finite(humanoid.Health) and humanoid.Health > 0
+    local bulletEligible = cameraEligible or H.enemyDamageable(instance)
+    if options.camera and not cameraEligible then return nil end
+    if options.bullet and not bulletEligible then return nil end
+    local distance = (root.Position - origin).Magnitude
+    local range = options.range or Config.EnemyScanRange or 1400
+    if not H.finite(range) or range < 0 or distance > range then return nil end
+    local head = instance:IsA("Model") and instance:FindFirstChild("Head") or nil
+    local aimPosition = root.Position
+    if head and head:IsA("BasePart") and H.finiteVector(head.Position) then aimPosition = head.Position end
+    return {instance = instance, root = root, humanoid = humanoid, player = targetPlayer,
+        position = root.Position, aimPosition = aimPosition, distance = distance,
+        cameraEligible = cameraEligible, bulletEligible = bulletEligible}
+end
+
+function H.scanEnemies(origin, options)
+    options = options or {}
+    local records, seen = {}, {}
+    local function add(instance)
+        if not instance or seen[instance] then return end
+        seen[instance] = true
+        local record = H.enemyRecord(instance, origin, options)
+        if record then table.insert(records, record) end
+    end
+    if options.allowPlayers ~= false then
+        for _, targetPlayer in ipairs(Players:GetPlayers()) do add(targetPlayer.Character) end
+    end
+    for instance in pairs(S.npcs) do
+        if instance.Parent and instance:IsDescendantOf(Workspace) then
+            if instance:IsA("BasePart") then
+                add(H.enemyOwner(instance))
+            elseif instance:IsA("Model") and (instance:FindFirstChildOfClass("Humanoid")
+                or instance:FindFirstChildOfClass("AnimationController") or H.enemyDamageable(instance)) then
+                add(instance)
+            else
+                -- Expand explicit NPC containers into real owning rigs/parts;
+                -- never aim at the combined root/bounds of a whole enemy folder.
+                for _, child in ipairs(instance:GetDescendants()) do
+                    if child:IsA("Model") and (child:FindFirstChildOfClass("Humanoid")
+                        or child:FindFirstChildOfClass("AnimationController") or H.enemyDamageable(child)) then add(child)
+                    elseif child:IsA("BasePart") then add(H.enemyOwner(child)) end
+                end
+            end
+        end
+    end
+    table.sort(records, function(a, b) return a.distance < b.distance end)
+    return records
+end
+
+function H.npcNameHint(name)
+    if not Config.UseNPCNameHints then return false end
+    local tokens = H.tokens(name)
+    for _, word in ipairs(Config.NPCNameHints) do
+        if tokens[word] then return true end
+    end
+    -- Also match lower-case compound names such as "sandwormboss".
+    return name:lower():find("worm", 1, true) ~= nil
+end
+
+function H.npcMarked(instance)
+    return H.enemyExplicitHostile(instance) or H.npcNameHint(instance.Name)
+end
+
+function H.npcCandidate(instance)
+    if not (instance:IsA("Model") or instance:IsA("BasePart") or instance:IsA("Folder")) then return false end
+    if H.npcMarked(instance) then return true end
+    if instance:IsA("Model") and (instance:FindFirstChildOfClass("Humanoid")
+        or instance:FindFirstChildOfClass("AnimationController") or H.enemyDamageable(instance)) then return true end
+    -- Target values can begin empty and change later; watch their owning rig now.
+    for _, container in ipairs(instance:GetChildren()) do
+        if container:IsA("ObjectValue") then
+            local name = container.Name:lower()
+            if name:find("target", 1, true) or name == "enemy" then return true end
+        end
+    end
+    return false
+end
+
+function H.refreshObject(instance)
+    if not S.alive or not instance.Parent then return end
+    local wasHazard = S.hazards[instance]
+    S.hazards[instance] = H.hazardCandidate(instance) or nil
+    if wasHazard or S.hazards[instance] then S.hazardCache = nil end
+    S.npcs[instance] = H.npcCandidate(instance) or nil
+    if S.flags.bullet and instance:IsA("BasePart") then H.tryRegisterBullet(instance) end
+    -- A model can be inserted before its parts or humanoid exist.
+    local ancestor = instance.Parent
+    while ancestor and ancestor ~= Workspace do
+        if ancestor:IsA("Model") or ancestor:IsA("Folder") then
+            local ancestorHazard = S.hazards[ancestor]
+            S.hazards[ancestor] = H.hazardCandidate(ancestor) or nil
+            if ancestorHazard or S.hazards[ancestor] then S.hazardCache = nil end
+            S.npcs[ancestor] = H.npcCandidate(ancestor) or nil
+        end
+        if S.flags.bullet and ancestor:IsA("BasePart") then H.tryRegisterBullet(ancestor) end
+        ancestor = ancestor.Parent
+    end
+end
+
+function H.watchObject(instance)
+    if not S.alive or not instance:IsDescendantOf(Workspace) then return end
+    if H.watchEnemyMetadata(instance) then return end
+    if instance:IsA("Humanoid") or instance:IsA("AnimationController") then H.refreshObject(instance); return end
+    if not (instance:IsA("BasePart") or instance:IsA("Model") or instance:IsA("Explosion") or instance:IsA("Folder")) then return end
+    if S.watchers[instance] then H.refreshObject(instance); return end
+    local connections = {}
+    S.watchers[instance] = connections
+    H.connect(instance:GetPropertyChangedSignal("Name"), function()
+        H.refreshObject(instance)
+        H.queueBranch(instance)
+    end, connections)
+    H.connect(instance.AttributeChanged, function(attribute)
+        H.refreshObject(instance)
+        if attribute == "ProtectionIgnore" or attribute == "Active" or attribute == "IsActive" or attribute == "Armed"
+            or attribute == "OwnerUserId" or attribute == "ShooterUserId" or attribute == "CreatorUserId" then
+            H.queueBranch(instance)
+        end
+    end, connections)
+    H.refreshObject(instance)
+end
+
+function H.queueBranch(instance)
+    if not S.alive or not instance:IsDescendantOf(Workspace) then return end
+    -- Refresh existing watches as well as newly discovered children.
+    for _, child in ipairs(instance:GetDescendants()) do table.insert(S.pending, child) end
+end
+
+function H.removeObject(instance)
+    local connections = S.watchers[instance]
+    if connections then H.disconnectAll(connections); S.watchers[instance] = nil end
+    if S.hazards[instance] then S.hazardCache = nil end
+    S.hazards[instance], S.motion[instance], S.npcs[instance] = nil, nil, nil
+    S.hazardErrors[instance], S.impactEntries[instance], S.guidedBullets[instance] = nil, nil, nil
+end
+
+function H.clearSpace(target)
+    if not H.ready() or not H.finiteVector(target.Position)
+        or target.Position.Y <= Workspace.FallenPartsDestroyHeight + 8 then return false end
+    local ctx = S.context
+    -- Character:GetBoundingBox includes oversized pets, shields and cosmetics, which
+    -- previously made many perfectly reasonable saved/spawn positions look obstructed.
+    local clearanceHeight = math.max(3.8, ctx.humanoid.HipHeight + ctx.root.Size.Y + 1.0)
+    local clearance = Vector3.new(math.max(2.6, ctx.root.Size.X + 0.5),
+        clearanceHeight, math.max(2.6, ctx.root.Size.Z + 0.5))
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {ctx.character}
+    params.MaxParts = 0
+    for _, part in ipairs(Workspace:GetPartBoundsInBox(target, clearance * 0.92, params)) do
+        if part.CanCollide then return false end
+    end
+    -- Terrain cannot be found by bounding-box overlap reliably on every terrain shape.
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {ctx.character}
+    rayParams.RespectCanCollide = true
+    for _, axis in ipairs({target.RightVector * clearance.X * 0.45,
+        target.UpVector * clearance.Y * 0.45,
+        target.LookVector * clearance.Z * 0.45}) do
+        local hit = Workspace:Raycast(target.Position - axis, axis * 2, rayParams)
+        if hit and hit.Instance:IsA("Terrain") then return false end
+    end
+    return true
+end
+
+function H.clearEscapePath(target)
+    local ctx = S.context
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {ctx.character}
+    params.RespectCanCollide = true
+    local displacement = target.Position - ctx.root.Position
+    for _, height in ipairs({0, math.max(2, ctx.root.Size.Y * 0.5 + 1)}) do
+        if Workspace:Raycast(ctx.root.Position + Vector3.new(0, height, 0), displacement, params) then return false end
+    end
+    return true
+end
+
+function H.safeDestination(target)
+    return H.clearSpace(target) and H.findHazard(target.Position, Vector3.zero, false) == nil
+end
+
+function H.landingAt(target)
+    if not H.ready() then return nil end
+    local ctx = S.context
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {ctx.character}
+    params.RespectCanCollide = true
+    local hit = Workspace:Raycast(target.Position + Vector3.new(0, 2, 0),
+        Vector3.new(0, -(Config.MaxEscapeDistance + 50), 0), params)
+    if not hit or hit.Normal.Y < 0.5 then return nil end
+    local height = math.max(3, ctx.humanoid.HipHeight + ctx.root.Size.Y * 0.5 + 0.25)
+    local result = CFrame.new(hit.Position + Vector3.new(0, height, 0)) * (target - target.Position)
+    if H.safeDestination(result) then return result end
+    return nil
+end
+
+function H.escapeDirections(pursuit, current)
+    local away = pursuit and (current.Position - pursuit.bounds.Position) or current.LookVector
+    away = Vector3.new(away.X, 0, away.Z)
+    if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
+    away = away.Unit
+    local velocity = pursuit and pursuit.velocity or Vector3.zero
+    local flat = Vector3.new(velocity.X, 0, velocity.Z)
+    -- Cross the attack trajectory instead of just running ahead along it.
+    local side = flat.Magnitude > 1 and Vector3.new(-flat.Z, 0, flat.X).Unit
+        or Vector3.new(-away.Z, 0, away.X)
+    if S.escape and (S.escape.chaseCount or 0) % 2 == 1 then side = -side end
+    return away, side
+end
+
+function H.escapeClearance(target, records)
+    local clearance = 180
+    for _, info in ipairs(records) do
+        if H.threatAt(info, target.Position, Vector3.zero, false) then return nil end
+        local steps = (info.acceleration or Vector3.zero).Magnitude > 1 and Config.HazardPredictionSteps or 1
+        local from = target.Position
+        for step = 1, steps do
+            local time = Config.PredictionSeconds * step / steps
+            local relative = target.Position - info.velocity * time - H.hazardAccelerationOffset(info, time)
+            local distance = H.segmentBoxDistance(info.bounds, info.size, from, relative - from)
+                - info.radius - Config.HazardMargin - math.min(8, (info.angularSpeed or 0) * info.size.Magnitude * 0.025)
+            clearance = math.min(clearance, distance)
+            from = relative
+        end
+    end
+    local score = clearance
+    local now = os.clock()
+    for _, entry in ipairs(S.escapeHistory) do
+        if now - entry.time < Config.ChaseHistoryDuration then
+            score -= math.max(0, 30 - (target.Position - entry.position).Magnitude) * 1.5
+        end
+    end
+    score -= (target.Position - S.context.root.Position).Magnitude * 0.08
+    return score
+end
+
+function H.selectEscapeTarget(candidates)
+    if not H.ready() then return nil end
+    local records, best, bestScore = H.hazardSnapshot(), nil, nil
+    for _, target in ipairs(candidates) do
+        if H.finiteVector(target.Position) and (target.Position - S.context.root.Position).Magnitude > 3 then
+            local score = H.escapeClearance(target, records)
+            -- PivotTo has no intervening physical path. A roof between the old
+            -- and new poses must not veto an otherwise clear destination.
+            if score and (not bestScore or score > bestScore) and H.clearSpace(target) then
+                best, bestScore = target, score
+            end
+        end
+    end
+    return best
+end
+
+-- Repeated pursuit widens the search, changes its angle and checks every
+-- destination against the entire sampled hazard set.
+function H.emergencyEscape(reason, pursuit)
+    if not S.flags.lock or not H.ready() then return false end
+    local now = os.clock()
+    local current = S.context.root.CFrame
+    local previous = S.escape
+    local already = previous and previous.mode == "emergency"
+    local home = previous and previous.home or S.lockTarget or current
+    if already then
+        previous.earliestReturn = math.max(previous.earliestReturn, now + Config.EmergencyMinDuration)
+        previous.safeSince = nil
+        pursuit = pursuit or H.findSevereHazardNear(current.Position)
+            or H.findHazard(current.Position)
+        local urgent = pursuit and H.threatAt(pursuit, current.Position)
+            and select(3, H.threatAt(pursuit, current.Position)) <= Config.UrgentImpactTime
+        local cooldown = urgent and Config.UrgentRelocateCooldown or Config.EmergencyRetriggerCooldown
+        if now - S.lastEmergency < cooldown then return true end
+        -- A new HP drop is enough to shift, even without a named hazard.
+        if not pursuit and now - S.lastDamageAt > 0.28 then return true end
+    end
+
+    local orientation = current - current.Position
+    local count = (previous and previous.chaseCount or 0) + (already and 1 or 0)
+    local away, side = H.escapeDirections(pursuit, current)
+    local radius = pursuit and pursuit.radius or 0
+    local bodyReach = pursuit and pursuit.size.Magnitude * 0.5 or 0
+    local needed = radius + bodyReach + Config.HazardMargin + 24
+    local step = math.min(Config.ChaseMaxHorizontalDistance * 0.6,
+        math.max(36 + count * 10 + radius * 0.5, needed))
+    local baseY = already and current.Position.Y or math.max(current.Position.Y, home.Position.Y) + Config.EmergencyHeight
+    if pursuit then
+        baseY = math.max(baseY, pursuit.bounds.Position.Y + pursuit.size.Magnitude * 0.5
+            + radius + Config.HazardMargin + 12)
+    end
+    baseY = math.min(baseY, home.Position.Y + Config.ChaseMaxHeight)
+    local base = Vector3.new(current.Position.X, baseY, current.Position.Z)
+    local candidates = {CFrame.new(base) * orientation}
+    local directions = {side, -side, away, -away}
+    for _, diagonal in ipairs({away + side, away - side}) do
+        if diagonal.Magnitude > 0.1 then table.insert(directions, diagonal.Unit) end
+    end
+    local target
+    for _, distance in ipairs({step, math.min(Config.ChaseMaxHorizontalDistance, math.max(step * 1.8, needed + 70))}) do
+        for _, direction in ipairs(directions) do
+            for _, lift in ipairs({0, already and 24 or 12, already and -16 or -Config.EmergencyHeight}) do
+                local position = base + direction * distance + Vector3.new(0, lift, 0)
+                local flatHome = Vector3.new(position.X - home.Position.X, 0, position.Z - home.Position.Z)
+                if flatHome.Magnitude <= Config.ChaseMaxHorizontalDistance
+                    and position.Y <= home.Position.Y + Config.ChaseMaxHeight then
+                    table.insert(candidates, CFrame.new(position) * orientation)
+                end
+            end
+        end
+        target = H.selectEscapeTarget(candidates)
+        if target then break end
+    end
+    if target and (target.Position - current.Position).Magnitude > 3
+        and H.beginEscapeMove(target, "emergency", home, reason) then
+        S.escape.chaseCount, S.escape.pursuer = count, pursuit and pursuit.instance
+        S.escape.lastThreatAt = now
+        S.escape.earliestReturn = now + Config.EmergencyMinDuration
+        S.lastEmergency, S.lastEscape, S.lastChaseRelocate = now, now, now
+        H.notice(already and "EMERGENCY: changed direction to evade pursuit"
+            or "EMERGENCY: moved to a clear escape position", 3)
+        return true
+    end
+    if already then
+        previous.safeSince = nil
+        H.notice("Chase detected; no clear alternative escape point", 3)
+    else
+        H.notice("Emergency move blocked by local geometry", 3)
+    end
+    return false
+end
+
+function H.isSevereThreat(info, position)
+    if not info then return false end
+    local distance = H.boxDistance(position, info.bounds, info.size)
+    -- Large model name/tags do not imply an emergency hundreds of studs away.
+    local reach = Config.EmergencyGuardRadius
+        + math.min(info.radius, Config.EmergencyProactiveRadiusCap)
+    local danger = H.threatAt(info, position)
+    if distance > reach and not danger then return false end
+    local approaching = info.velocity:Dot(position - info.bounds.Position) > 0
+    return (info.grabbed and distance <= reach)
+        or (info.moving and info.velocity.Magnitude >= Config.EmergencyFastThreatSpeed
+            and (danger or (distance <= reach and approaching)))
+        or (info.spinning and distance <= reach)
+        or ((info.erratic or info.teleported) and (danger or distance <= reach))
+        or (os.clock() - S.lastDamageAt < 0.8 and info.explicit)
+end
+
+-- Fast preliminary screening does not require the threat to already be on a
+-- collision course. Grabs, violent motion and sudden reversals can precede hits.
+function H.findSevereHazardNear(position)
+    local closest, bestDistance = nil, math.huge
+    for _, info in ipairs(H.hazardSnapshot()) do
+        if info and H.isSevereThreat(info, position) then
+            local distance = H.boxDistance(position, info.bounds, info.size)
+            if distance < bestDistance then
+                closest, bestDistance = info, distance
+            end
+        end
+    end
+    return closest
+end
+
+function H.findChaseThreat(position)
+    local impact = H.findHazard(position)
+    if impact then return impact end
+    local best, bestDistance = nil, math.huge
+    for _, info in ipairs(H.hazardSnapshot()) do
+        local distance = H.boxDistance(position, info.bounds, info.size) - info.radius
+        local approaching = info.velocity:Dot(position - info.bounds.Position) > 0
+        if distance <= Config.ChaseGuardRadius and distance < bestDistance
+            and (info.grabbed or info.spinning or info.erratic or info.teleported
+                or (info.moving and approaching)
+                or (not info.moving and info.recentlyMoved and S.escape and S.escape.pursuer == info.instance)) then
+            best, bestDistance = info, distance
+        end
+    end
+    return best
+end
+
+function H.nearHazard(position, radius)
+    local closest, bestDistance = nil, math.huge
+    for _, info in ipairs(H.hazardSnapshot()) do
+        if info then
+            -- Do not allow static name-only scenery to pin the player in the sky.
+            if info.explicit or info.moving or info.grabbed then
+                local distance = H.boxDistance(position, info.bounds, info.size)
+                if distance <= radius + info.radius and distance < bestDistance then
+                    closest, bestDistance = info, distance
+                end
+            end
+        end
+    end
+    return closest
+end
+
+function H.recordContact(info)
+    if not info then return false end
+    local now = os.clock()
+    local key = info.instance
+    local last = S.impactEntries[key]
+    if not last or now - last.last > 3.5 then
+        S.impactEntries[key] = {last = now, first = now, countedAt = now, count = 1}
+        return false
+    end
+    -- Continuous pressure is also a persistent encounter. Use a separate
+    -- counting timestamp; refreshing last every frame previously prevented it.
+    if now - (last.countedAt or last.first) >= 0.55 then
+        last.count, last.countedAt = last.count + 1, now
+    end
+    last.last = now
+    return last.count >= 3
+end
+
+function H.escape(hazard, reason)
+    if not hazard or not S.flags.lock or not H.ready()
+        or (S.escape and S.escape.mode == "emergency")
+        or (os.clock() - S.lastEscape < Config.EscapeCooldown
+            and (hazard.impactTime or math.huge) > Config.UrgentImpactTime) then return false end
+    local ctx = S.context
+    local home = S.escape and S.escape.home or S.lockTarget or ctx.root.CFrame
+    local origin = ctx.root.CFrame
+    local away, side = H.escapeDirections(hazard, origin)
+    local offsets = {side * 12, -side * 12, away * 14,
+        side * 20, -side * 20, away * 24,
+        Vector3.new(0, Config.EscapeHeight, 0),
+        side * 14 + Vector3.new(0, 8, 0),
+        -side * 14 + Vector3.new(0, 8, 0)}
+    local candidates = {}
+    for _, offset in ipairs(offsets) do
+        if offset.Magnitude <= Config.MaxEscapeDistance then
+            table.insert(candidates, origin + offset)
+        end
+    end
+    local count = S.escape and (S.escape.chaseCount or 0) or 0
+    local target = H.selectEscapeTarget(candidates)
+    if target and H.beginEscapeMove(target, "dodge", home, reason) then
+        S.escape.chaseCount, S.escape.pursuer = count, hazard.instance
+        S.escape.lastThreatAt = os.clock()
+        S.lastEscape, S.lastChaseRelocate = os.clock(), os.clock()
+        H.notice("Dodged " .. tostring(reason) .. "; tracking pursuit", 3)
+        return true
+    end
+    H.notice("Danger detected; no clear small dodge destination", 3)
+    return false
+end
+
+function H.destroyShield()
+    if S.ui.shield and S.ui.shield.Parent then S.ui.shield:Destroy() end
+    S.ui.shield = nil
+    if S.ui.forceField and S.ui.forceField.Parent then S.ui.forceField:Destroy() end
+    S.ui.forceField = nil
+end
+
+function H.ensureShield()
+    if not H.ready() or not S.flags.lock then return end
+    local ctx = S.context
+    if S.ui.shield and S.ui.shield.Parent == ctx.character then return end
+    H.destroyShield()
+    -- The sphere is welded to the locked root; it does not generate a local
+    -- touch-triggered damage zone. It is part of the character, so all our
+    -- clearance queries exclude it. CanQuery stays true because Roblox requires
+    -- CanCollide=false before CanQuery can be disabled.
+    local shield = Instance.new("Part")
+    shield.Name = "GR33D_InvisibleCollisionShell"
+    shield.Shape = Enum.PartType.Ball
+    shield.Size = Vector3.new(Config.ShieldDiameter, Config.ShieldDiameter, Config.ShieldDiameter)
+    shield.CFrame = ctx.root.CFrame
+    shield.Transparency = 1
+    shield.CanCollide = true
+    shield.CanTouch = false
+    shield.CanQuery = true
+    shield.Massless = true
+    shield.CastShadow = false
+    shield.Anchored = false
+    shield.Parent = ctx.character
+    local weld = Instance.new("WeldConstraint")
+    weld.Name = "GR33D_ShellWeld"
+    weld.Part0, weld.Part1 = ctx.root, shield
+    weld.Parent = shield
+    S.ui.shield = shield
+    local field = Instance.new("ForceField")
+    field.Name, field.Visible = "GR33D_LocalField", false
+    field.Parent = ctx.character
+    S.ui.forceField = field
+end
+
+-- Temporarily release collision/anchor leases while preserving the ON toggle.
+-- A local AlignPosition holds the actual unanchored rig at the escape position,
+-- rather than continuing to pin body limbs to the original lock point.
+function H.stopEscapeHold()
+    local hold = S.escapeHold
+    S.escapeHold = nil
+    if hold then
+        if hold.position then hold.position:Destroy() end
+        if hold.orientation then hold.orientation:Destroy() end
+        if hold.attachment then hold.attachment:Destroy() end
+    end
+end
+
+function H.suspendLock()
+    if not S.flags.lock then return end
+    if not S.lockSuspended then
+        H.release("lock")
+        H.destroyShield() -- local solid shell would fight movement while teleporting
+        S.lockSuspended = true
+    end
+end
+
+function H.ensureEscapeHold(target)
+    if not H.ready() or typeof(target) ~= "CFrame" or not H.finiteVector(target.Position) then return false end
+    local root = S.context.root
+    local hold = S.escapeHold
+    if not hold or not hold.attachment or hold.attachment.Parent ~= root
+        or not hold.position or hold.position.Parent ~= root
+        or not hold.orientation or hold.orientation.Parent ~= root
+        or hold.position.Attachment0 ~= hold.attachment or hold.orientation.Attachment0 ~= hold.attachment
+        or hold.position.Enabled == false or hold.orientation.Enabled == false then
+        H.stopEscapeHold()
+        local attachment, position, orientation
+        local ok, message = pcall(function()
+            attachment = Instance.new("Attachment")
+            attachment.Name, attachment.Parent = "GR33D_EscapeAttachment", root
+            position = Instance.new("AlignPosition")
+            position.Name = "GR33D_EscapePosition"
+            position.Mode = Enum.PositionAlignmentMode.OneAttachment
+            position.Attachment0 = attachment
+            position.ApplyAtCenterOfMass = true
+            position.MaxForce = math.max(160000, root.AssemblyMass * (Workspace.Gravity * 18 + 1200))
+            position.MaxVelocity = Config.EscapeHoldMaxVelocity
+            position.Responsiveness = Config.EscapeHoldResponsiveness
+            position.Position = target.Position
+            position.Parent = root
+            orientation = Instance.new("AlignOrientation")
+            orientation.Name = "GR33D_EscapeOrientation"
+            orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+            orientation.Attachment0 = attachment
+            orientation.MaxTorque = math.max(120000, root.AssemblyMass * 150000)
+            orientation.MaxAngularVelocity = 45
+            orientation.Responsiveness = 85
+            orientation.CFrame = target - target.Position
+            orientation.Parent = root
+        end)
+        if not ok then
+            if orientation then orientation:Destroy() end
+            if position then position:Destroy() end
+            if attachment then attachment:Destroy() end
+            H.report("Escape stabilization", message)
+            return false
+        end
+        hold = {attachment = attachment, position = position, orientation = orientation}
+        S.escapeHold = hold
+    end
+    hold.position.Position = target.Position
+    hold.orientation.CFrame = target - target.Position
+    return true
+end
+
+function H.beginEscapeMove(target, mode, home, reason)
+    if not S.flags.lock or not H.ready() then return false end
+    local prior = S.escape
+    local wasSuspended = S.lockSuspended
+    local oldTarget = S.lockTarget
+    local origin = S.context.root.CFrame
+    H.releaseIdle(true)
+    H.releaseFlingHold(Config.IdleInputGrace)
+    S.flingSnapshot = nil
+    local ok, held = pcall(function()
+        H.suspendLock() -- release anchors BEFORE moving the model
+        if not H.moveRoot(target) then return false end
+        H.zeroRigVelocity()
+        return H.ensureEscapeHold(target)
+    end)
+    if not ok or held ~= true then
+        H.notice("Escape hold unavailable; restoring previous lock", 5)
+        H.stopEscapeHold()
+        S.lockTarget = oldTarget or origin
+        pcall(H.moveRoot, S.lockTarget)
+        if wasSuspended and oldTarget then
+            local restored, result = pcall(H.ensureEscapeHold, oldTarget)
+            if restored and result then
+                S.lockSuspended = true
+                return false
+            end
+        end
+        -- If even the previous hold cannot be recovered, do not strand the
+        -- character in a temporary unlocked state with no active stabilizer.
+        S.escape, S.lockSuspended = nil, false
+        local restored, message = pcall(H.applyLock)
+        if not restored then
+            S.lockTarget = S.context.root.CFrame
+            pcall(H.claim, S.context.root, "Anchored", true, "lock")
+            H.report("Escape rollback", message)
+        end
+        return false
+    end
+    local now = os.clock()
+    S.lockTarget = target
+    S.escape = {home = home, mode = mode, reason = reason,
+        earliestReturn = now + (mode == "emergency" and Config.EmergencyMinDuration
+            or mode == "manual" and Config.ManualRearmDelay or Config.EscapeMinDuration),
+        safeSince = nil,
+        chaseCount = prior and prior.chaseCount or 0,
+        pursuer = prior and prior.pursuer,
+        lastThreatAt = prior and prior.lastThreatAt or -math.huge}
+    if mode == "manual" then S.escapeHistory = {} end
+    table.insert(S.escapeHistory, {position = origin.Position, time = now})
+    table.insert(S.escapeHistory, {position = target.Position, time = now})
+    while #S.escapeHistory > Config.ChaseHistorySize do table.remove(S.escapeHistory, 1) end
+    return true
+end
+
+function H.rearmLockAt(target)
+    if not H.ready() or not S.flags.lock then return false end
+    H.stopEscapeHold()
+    local ok, moved = pcall(H.moveRoot, target)
+    if not ok or not moved then
+        local restored, held = pcall(H.ensureEscapeHold, S.lockTarget)
+        if not restored or not held then
+            -- If movement and hold recreation both fail, pin the current pose
+            -- instead of leaving an airborne rig with no supporting constraint.
+            H.stopEscapeHold()
+            S.lockTarget = S.context.root.CFrame
+            S.escape, S.lockSuspended = nil, false
+            local locked, message = pcall(H.applyLock)
+            if not locked then
+                pcall(H.claim, S.context.root, "Anchored", true, "lock")
+                H.report("Lock restore", message)
+            end
+            H.notice("Return move failed; current position locked safely", 4)
+        end
+        return false
+    end
+    S.lockTarget, S.escape, S.lockSuspended = target, nil, false
+    H.applyLock()
+    return true
+end
+
+function H.updateEscapeHold()
+    if not S.escape or not H.ready() then return end
+    H.suspendLock()
+    local target = S.lockTarget
+    local ok, held = pcall(H.ensureEscapeHold, target)
+    if not ok or held ~= true then
+        H.notice("Escape stabilizer unavailable; check Output", 4)
+        return
+    end
+    -- If another local controller displaced the rig, try one correction.
+    -- Server-owned displacement cannot be overridden with a LocalScript.
+    local now = os.clock()
+    if (S.context.root.Position - target.Position).Magnitude > Config.EscapeDriftCorrection
+        and now - (S.lastEscapeDriftCorrection or -math.huge) > 0.3 then
+        S.lastEscapeDriftCorrection = now
+        H.moveRoot(target)
+        H.zeroRigVelocity()
+    end
+end
+
+function H.stopLock(tryLanding)
+    -- Turning OFF must cancel the temporary hold before dropping the player.
+    local landing = nil
+    if tryLanding and S.escape and H.ready() then
+        landing = H.safeDestination(S.escape.home) and S.escape.home
+            or H.landingAt(S.context.root.CFrame)
+        if not landing then H.notice("Lock off; no safe landing found", 5) end
+    end
+    H.stopEscapeHold()
+    if landing then H.moveRoot(landing) end
+    S.lockSuspended = false
+    S.lockTarget, S.escape = nil, nil
+    H.destroyShield()
+    H.release("lock")
+end
+
+local BODY_PART_NAMES = {
+    HumanoidRootPart = true, Head = true, Torso = true,
+    UpperTorso = true, LowerTorso = true,
+    LeftUpperArm = true, LeftLowerArm = true, LeftHand = true,
+    RightUpperArm = true, RightLowerArm = true, RightHand = true,
+    LeftUpperLeg = true, LeftLowerLeg = true, LeftFoot = true,
+    RightUpperLeg = true, RightLowerLeg = true, RightFoot = true,
+    ["Left Arm"] = true, ["Right Arm"] = true,
+    ["Left Leg"] = true, ["Right Leg"] = true,
+}
+
+local FLING_STATES = {
+    Enum.HumanoidStateType.Ragdoll,
+    Enum.HumanoidStateType.FallingDown,
+    Enum.HumanoidStateType.Physics,
+    Enum.HumanoidStateType.PlatformStanding,
+}
+
+function H.zeroRigVelocity()
+    if not S.context then return end
+    for _, part in ipairs(S.context.character:GetChildren()) do
+        if part:IsA("BasePart") and BODY_PART_NAMES[part.Name] then
+            pcall(function()
+                part.AssemblyLinearVelocity = Vector3.zero
+                part.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+    end
+end
+
+function H.recoverRagdoll()
+    if not H.ready() or not (S.flags.fling or S.flags.lock) then return end
+    if (S.flying or S.hovering) and not S.flags.lock then return end
+    local humanoid = S.context.humanoid
+    if S.flags.fling then
+        for _, state in ipairs(FLING_STATES) do H.claimState(humanoid, state, false, "fling") end
+    end
+    if S.flags.lock then
+        for _, state in ipairs(FLING_STATES) do H.claimState(humanoid, state, false, "lock") end
+    end
+    if humanoid.PlatformStand then humanoid.PlatformStand = false end
+    if humanoid.Sit then humanoid.Sit = false end
+    local state = humanoid:GetState()
+    if state == Enum.HumanoidStateType.Ragdoll
+        or state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.Physics
+        or state == Enum.HumanoidStateType.PlatformStanding then
+        humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+end
+
+function H.applyLock()
+    if not S.flags.lock or not H.ready() then return end
+    -- During dodge/emergency/manual teleport, NEVER re-anchor the rig.
+    if S.lockSuspended or S.escape then return end
+    local ctx = S.context
+    if not S.lockTarget then S.lockTarget = ctx.root.CFrame end
+    S.lockSuspended = false
+    -- Anchor R6/R15 body parts as in the reference; preserve the ORIGINAL property
+    -- for each part so turning Lock OFF can restore it without damaging the rig.
+    for _, part in ipairs(ctx.character:GetChildren()) do
+        if part:IsA("BasePart") and BODY_PART_NAMES[part.Name] then
+            H.claim(part, "Anchored", true, "lock")
+            -- Prevent our own locked limbs from colliding with the shell.
+            H.claim(part, "CanCollide", false, "lock")
+            if not H.finiteVector(part.AssemblyLinearVelocity)
+                or part.AssemblyLinearVelocity.Magnitude > 0 then
+                part.AssemblyLinearVelocity = Vector3.zero
+            end
+            if not H.finiteVector(part.AssemblyAngularVelocity)
+                or part.AssemblyAngularVelocity.Magnitude > 0 then
+                part.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+    end
+    if (ctx.root.Position - S.lockTarget.Position).Magnitude > 0.1
+        or ctx.root.CFrame.LookVector:Dot(S.lockTarget.LookVector) < 0.999 then
+        H.moveRoot(S.lockTarget)
+    end
+    ctx.humanoid:Move(Vector3.zero, false)
+    -- A collision sphere helps on the locally simulated side. Roblox's server
+    -- must also create/authorize a shield to block server-owned objects.
+    H.ensureShield()
+end
+
+function H.updateEscape()
+    if not S.flags.lock or not H.ready() then return end
+    local now = os.clock()
+    if now - S.lastProtectionScanAt < Config.HazardScanInterval then return end
+    S.lastProtectionScanAt = now
+    local position = S.context.root.Position
+    local home = S.escape and S.escape.home or S.lockTarget
+    local severeAtHome = home and H.findSevereHazardNear(home.Position)
+    if severeAtHome then
+        S.lastSevereThreatAt, S.homeThreatAt = now, now
+        if not S.escape or S.escape.mode == "dodge" then
+            if H.emergencyEscape(severeAtHome.name .. " abnormal movement", severeAtHome) then
+                return
+            end
+        end
+    end
+    if S.escape then H.updateEscapeHold() end
+    if home and S.escape and S.escape.mode == "emergency"
+        and H.nearHazard(home.Position, Config.EmergencyGuardRadius) then
+        S.homeThreatAt = now
+    end
+
+    local threat = H.findHazard(position)
+    local pursuing = S.escape and (threat or H.findChaseThreat(position))
+    if pursuing then
+        S.lastChaseThreatAt = now
+        S.escape.lastThreatAt = now
+        S.escape.safeSince = nil
+        local cooldown = (pursuing.impactTime or math.huge) <= Config.UrgentImpactTime
+            and Config.UrgentRelocateCooldown or Config.ChaseRelocateCooldown
+        if now - S.lastChaseRelocate >= cooldown then
+            if S.escape.mode == "emergency" or S.escape.mode == "manual" then
+                H.emergencyEscape("pursuing " .. pursuing.name, pursuing)
+            elseif H.isSevereThreat(pursuing, position) or (S.escape.chaseCount or 0) >= 2 then
+                H.emergencyEscape("pursuing " .. pursuing.name, pursuing)
+            else
+                local count = (S.escape.chaseCount or 0) + 1
+                if H.escape(pursuing, pursuing.name) then
+                    S.escape.chaseCount = count
+                elseif threat then
+                    H.emergencyEscape("repeated " .. pursuing.name, pursuing)
+                end
+            end
+        end
+    elseif threat then
+        S.recentHazard = threat
+    end
+
+    if not S.escape and threat then
+        S.recentHazard = threat
+        if H.isSevereThreat(threat, position) or H.recordContact(threat) then
+            S.lastSevereThreatAt = now
+            H.emergencyEscape(threat.name .. " abnormal contact", threat)
+        else
+            if not H.escape(threat, threat.name) then H.emergencyEscape(threat.name .. " blocked small dodge", threat) end
+        end
+    end
+    if not S.escape then return end
+    if now < S.escape.earliestReturn then return end
+    -- Cannot safely re-arm while a hazard is still following the airborne rig.
+    local persistent = (S.escape.chaseCount or 0) >= 2
+    local quiet = persistent and Config.ChaseReturnQuiet or Config.ChaseQuietWindow
+    if now - math.max(S.lastChaseThreatAt, S.escape.lastThreatAt or -math.huge) < quiet then
+        S.escape.safeSince = nil
+        return
+    end
+    local safeHome = H.safeDestination(S.escape.home)
+    if S.escape.mode == "emergency" or persistent then
+        if H.nearHazard(S.escape.home.Position, Config.EmergencyGuardRadius) then
+            S.homeThreatAt = now
+            safeHome = false
+        end
+        if now - S.homeThreatAt < Config.EmergencyHomeDangerHold
+            or now - S.lastDamageAt < Config.EmergencyReturnQuiet then
+            safeHome = false
+        end
+    end
+    if not safeHome then
+        S.escape.safeSince = nil
+        return
+    end
+    S.escape.safeSince = S.escape.safeSince or now
+    local grace = persistent and Config.ChaseReturnQuiet or S.escape.mode == "emergency" and Config.EmergencyReturnQuiet
+        or S.escape.mode == "manual" and Config.ManualRearmDelay
+        or Config.ReturnSafeGrace
+    if now - S.escape.safeSince < grace then return end
+    local destination = S.escape.home
+    if H.rearmLockAt(destination) then
+        H.notice("Returned to safe position; lock restored", 3)
+    end
+end
+
+function H.noclip(owner, enabled)
+    if not H.ready() then return end
+    if not enabled then H.release(owner); return end
+    for part in pairs(S.context.parts) do
+        if part:IsDescendantOf(S.context.character) then H.claim(part, "CanCollide", false, owner) end
+    end
+end
+
+function H.stopMover()
+    local wasHovering = S.hovering
+    if S.mover then
+        S.mover.velocity:Destroy()
+        if S.mover.orientation then S.mover.orientation:Destroy() end
+        S.mover.attachment:Destroy()
+        S.mover = nil
+    end
+    H.release("mover")
+    S.flying, S.hovering, S.hoverY = false, false, nil
+    S.hoverStartedAt, S.hoverQuietSince = nil, nil
+    if wasHovering and H.ready() and not S.context.humanoid.PlatformStand then
+        H.zeroRigVelocity()
+        S.context.humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+    end
+end
+
+function H.startMover(kind, target)
+    if not H.ready() or S.flags.lock then return false end
+    H.releaseIdle(true)
+    H.releaseFlingHold(Config.IdleInputGrace)
+    S.flingSnapshot = nil
+    if S.afkPulseUntil then S.context.humanoid:Move(Vector3.zero, false) end
+    S.afkPulseUntil, S.afkPostPulseUntil = nil, -math.huge
+    H.stopMover()
+    local ctx = S.context
+    if ctx.root.Anchored then
+        H.notice("Movement blocked: character is anchored", 3)
+        return false
+    end
+    if kind == "hover" and not target then return false end
+    local attachment = Instance.new("Attachment")
+    attachment.Name = "GR33D_MovementAttachment"
+    attachment.Parent = ctx.root
+    local velocity = Instance.new("LinearVelocity")
+    velocity.Name = "GR33D_MovementVelocity"
+    velocity.Attachment0 = attachment
+    velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+    velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+    velocity.ForceLimitsEnabled = true
+    velocity.ForceLimitMode = Enum.ForceLimitMode.Magnitude
+    velocity.MaxForce = kind == "flight" and Config.FlightMaxForce
+        or math.max(10000, ctx.root.AssemblyMass * (Workspace.Gravity * 4 + 1000))
+    velocity.VectorVelocity = Vector3.zero
+    velocity.Parent = ctx.root
+    S.mover = {attachment = attachment, velocity = velocity, kind = kind}
+    -- Set the flags before property listeners can run anti-ragdoll recovery.
+    S.flying, S.hovering = kind == "flight", kind == "hover"
+    -- Reference flight leaves the Humanoid's state and normal movement control intact.
+    if kind == "hover" then
+        H.release("fling") -- restore PlatformStanding while our mover owns it
+        H.claim(ctx.humanoid, "PlatformStand", true, "mover")
+        H.claim(ctx.humanoid, "AutoRotate", false, "mover")
+        H.noclip("mover", true)
+        local orientation = Instance.new("AlignOrientation")
+        orientation.Name = "GR33D_SkywalkOrientation"
+        orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+        orientation.Attachment0 = attachment
+        orientation.MaxTorque = math.max(100000, ctx.root.AssemblyMass * 10000)
+        orientation.MaxAngularVelocity = 30
+        orientation.Responsiveness = 25
+        local facing = Vector3.new(ctx.root.CFrame.LookVector.X, 0, ctx.root.CFrame.LookVector.Z)
+        if facing.Magnitude < 0.001 then facing = Vector3.new(0, 0, -1) end
+        orientation.CFrame = CFrame.lookAt(Vector3.zero, facing)
+        orientation.Parent = ctx.root
+        S.mover.orientation = orientation
+        S.hoverY, S.hoverStartedAt = target.Position.Y, os.clock()
+        if not H.moveRoot(target) then H.stopMover(); return false end
+        H.zeroRigVelocity()
+    else
+        ctx.humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+    end
+    return true
+end
+
+function H.endHover(land, requireLanding)
+    if not S.hovering then return false end
+    local target = land and H.ready() and H.npcLandingAt(S.context.root.CFrame) or nil
+    -- An automatic exit must never remove support over a void or a monster.
+    if requireLanding and not target then return false end
+    H.stopMover()
+    if target then H.moveRoot(target) end
+    if H.ready() then
+        H.zeroRigVelocity()
+        S.context.humanoid:ChangeState(target and Enum.HumanoidStateType.GettingUp
+            or Enum.HumanoidStateType.Freefall)
+    end
+    H.releaseFlingHold(Config.IdleInputGrace)
+    S.flingSnapshot = nil
+    S.lastDrop = os.clock()
+    return true
+end
+
+function H.npcExcluded(instance)
+    if not instance.Parent or not instance:IsDescendantOf(Workspace) then return true end
+    local current = instance
+    while current and current ~= Workspace do
+        if current:IsA("Accessory") or current:IsA("Tool") then return true end
+        if current:IsA("Model") and Players:GetPlayerFromCharacter(current) then return true end
+        if H.enemyFriendly(current) or H.enemyInactive(current) then return true end
+        current = current.Parent
+    end
+    return false
+end
+
+function H.hostileNPC(instance)
+    if H.npcExcluded(instance) then return false end
+    local current, nearestModel = instance, nil
+    while current and current ~= Workspace do
+        if current:IsA("Model") and not nearestModel then nearestModel = current end
+        if H.enemyExplicitHostile(current) then return true end
+        -- An owning rig's optional name hint is useful; a whole map/container's
+        -- generic name must not turn every AI below it into an enemy.
+        if (current == instance or current == nearestModel) and H.npcNameHint(current.Name) then return true end
+        -- A folder-only segmented worm can still use its explicit worm name.
+        if current:IsA("Folder") and Config.UseNPCNameHints and current.Name:lower():find("worm", 1, true) then return true end
+        current = current.Parent
+    end
+    return false
+end
+
+function H.npcExtents(bounds, size)
+    local half = size * 0.5
+    local right, up, look = bounds.RightVector, bounds.UpVector, bounds.LookVector
+    return Vector3.new(
+        math.abs(right.X) * half.X + math.abs(up.X) * half.Y + math.abs(look.X) * half.Z,
+        math.abs(right.Y) * half.X + math.abs(up.Y) * half.Y + math.abs(look.Y) * half.Z,
+        math.abs(right.Z) * half.X + math.abs(up.Z) * half.Y + math.abs(look.Z) * half.Z)
+end
+
+function H.npcBounds(instance)
+    if instance:IsA("BasePart") then return instance.CFrame, instance.Size end
+    if instance:IsA("Model") then
+        if not instance:FindFirstChildWhichIsA("BasePart", true) then return nil end
+        return instance:GetBoundingBox()
+    end
+    -- Some segmented worms are stored in a Folder rather than a Model.
+    local minimum, maximum
+    for _, part in ipairs(instance:GetDescendants()) do
+        if part:IsA("BasePart") and not H.ignored(part) then
+            local half = H.npcExtents(part.CFrame, part.Size)
+            local low, high = part.Position - half, part.Position + half
+            if not minimum then minimum, maximum = low, high else
+                minimum = Vector3.new(math.min(minimum.X, low.X), math.min(minimum.Y, low.Y), math.min(minimum.Z, low.Z))
+                maximum = Vector3.new(math.max(maximum.X, high.X), math.max(maximum.Y, high.Y), math.max(maximum.Z, high.Z))
+            end
+        end
+    end
+    if minimum then return CFrame.new((minimum + maximum) * 0.5), maximum - minimum end
+    return nil
+end
+
+function H.npcProximity(position)
+    local closest3D, closestXZ, highestTop = math.huge, math.huge, -math.huge
+    local seen = {}
+    for instance in pairs(S.npcs) do
+        if H.hostileNPC(instance) then
+            -- Measure actual body parts instead of the empty space inside a
+            -- container's bounding box. This also excludes friendly/dead children.
+            local bodies = instance:IsA("BasePart") and {instance} or instance:GetDescendants()
+            for _, part in ipairs(bodies) do
+                if part:IsA("BasePart") and not seen[part] and not H.npcExcluded(part) then
+                    seen[part] = true
+                    local bounds, size = H.npcBounds(part)
+                    if H.finiteVector(bounds.Position) and H.finiteVector(size) then
+                        local half = H.npcExtents(bounds, size)
+                        local offset = position - bounds.Position
+                        local flat = Vector3.new(math.max(0, math.abs(offset.X) - half.X), 0,
+                            math.max(0, math.abs(offset.Z) - half.Z)).Magnitude
+                        closest3D = math.min(closest3D, H.boxDistance(position, bounds, size))
+                        closestXZ = math.min(closestXZ, flat)
+                        if flat <= Config.NPCStopDistance then
+                            highestTop = math.max(highestTop, bounds.Position.Y + half.Y)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return closest3D, closestXZ, highestTop
+end
+
+function H.npcEscapeTarget(minimumY)
+    local root = S.context.root
+    for _, extra in ipairs({0, 25, 60, 120}) do
+        local target = root.CFrame + Vector3.new(0, minimumY + extra - root.Position.Y, 0)
+        -- This is a teleport: a ceiling along the old path must not block a clear
+        -- destination above it. The active skywalk owns noclip for the character.
+        if H.safeDestination(target) then return target end
+    end
+    return nil
+end
+
+function H.npcLandingAt(target)
+    if not H.ready() then return nil end
+    local ctx = S.context
+    local exclusions = {ctx.character}
+    for instance in pairs(S.npcs) do
+        if H.hostileNPC(instance) then table.insert(exclusions, instance) end
+    end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclusions
+    params.RespectCanCollide = true
+    local hit = Workspace:Raycast(target.Position + Vector3.new(0, 2, 0),
+        Vector3.new(0, -Config.NPCLandingDepth, 0), params)
+    if not hit or hit.Normal.Y < 0.5 then return nil end
+    local height = math.max(3, ctx.humanoid.HipHeight + ctx.root.Size.Y * 0.5 + 0.25)
+    local result = CFrame.new(hit.Position + Vector3.new(0, height, 0)) * (target - target.Position)
+    local distance, flat = H.npcProximity(result.Position)
+    if distance <= Config.NPCStartDistance or flat <= Config.NPCStopDistance then return nil end
+    if H.safeDestination(result) then return result end
+    return nil
+end
+
+function H.updateNPCs()
+    if not S.flags.monster or not H.ready() or S.flags.lock or S.flying then return end
+    local position, now = S.context.root.Position, os.clock()
+    local closest3D, closestXZ, highestTop = H.npcProximity(position)
+    if not S.hovering then
+        if closest3D <= Config.NPCStartDistance then
+            local target = H.npcEscapeTarget(math.max(position.Y + Config.NPCLiftHeight,
+                highestTop + Config.NPCClearanceHeight))
+            if target and H.startMover("hover", target) then
+                S.lastNPCLift = now
+                H.notice("Anti-Monster: teleported up; skywalk active", 3)
+            elseif not target and now - S.lastNPCLift >= 2 then
+                S.lastNPCLift = now
+                H.notice("Anti-Monster: no clear skywalk destination", 2)
+            end
+        end
+    elseif closestXZ <= Config.NPCStopDistance then
+        -- Track the worm below without a vertical cutoff; gaining altitude does
+        -- not mean the same body underneath is safe to land on.
+        S.hoverQuietSince = nil
+        if highestTop + Config.NPCClearanceHeight > S.hoverY
+            and now - S.lastNPCLift >= Config.NPCLiftCooldown then
+            local target = H.npcEscapeTarget(highestTop + Config.NPCClearanceHeight)
+            if target and H.moveRoot(target) then
+                S.hoverY, S.lastNPCLift = target.Position.Y, now
+                H.zeroRigVelocity()
+            end
+        end
+    else
+        S.hoverQuietSince = S.hoverQuietSince or now
+        if now - S.hoverStartedAt >= Config.NPCMinHoverDuration
+            and now - S.hoverQuietSince >= Config.NPCQuietTime then H.endHover(true, true) end
+    end
+end
+
+function H.inputMoveVector()
+    if not S.controls then return nil end
+    local ok, vector = pcall(function() return S.controls:GetMoveVector() end)
+    if ok and typeof(vector) == "Vector3" and H.finiteVector(vector) then return vector end
+    return nil
+end
+
+function H.skywalkDirection()
+    if UserInputService:GetFocusedTextBox() then return Vector3.zero end
+    local input = H.inputMoveVector()
+    local camera = Workspace.CurrentCamera
+    if not input then
+        local function down(key) return UserInputService:IsKeyDown(key) and 1 or 0 end
+        local x = math.max(down(Enum.KeyCode.D), down(Enum.KeyCode.Right))
+            - math.max(down(Enum.KeyCode.A), down(Enum.KeyCode.Left))
+        local z = math.max(down(Enum.KeyCode.S), down(Enum.KeyCode.Down))
+            - math.max(down(Enum.KeyCode.W), down(Enum.KeyCode.Up))
+        if x ~= 0 or z ~= 0 then input = Vector3.new(x, 0, z) end
+    end
+    if input and camera then
+        local forward = Vector3.new(camera.CFrame.LookVector.X, 0, camera.CFrame.LookVector.Z)
+        if forward.Magnitude < 0.001 then
+            local right = camera.CFrame.RightVector
+            forward = Vector3.new(right.Z, 0, -right.X)
+        end
+        forward = forward.Unit
+        local right = Vector3.new(-forward.Z, 0, forward.X)
+        local direction = right * input.X - forward * input.Z
+        return direction.Magnitude > 1 and direction.Unit or direction
+    end
+    local direction = S.context.humanoid.MoveDirection
+    return Vector3.new(direction.X, 0, direction.Z)
+end
+
+function H.updateMover()
+    if not S.mover or not H.ready() then return end
+    local ctx = S.context
+    if ctx.root.Anchored then H.stopMover(); H.notice("Movement stopped: root is anchored", 3); return end
+    local direction = ctx.humanoid.MoveDirection
+    if S.flying then
+        -- Same steering as the reference v6.1: Camera X/Z movement is normalized;
+        -- looking up/down permits climbing/descending without separate keys.
+        if ctx.humanoid.FloorMaterial ~= Enum.Material.Air then
+            H.stopMover()
+            return
+        end
+        local camera = Workspace.CurrentCamera
+        local input = H.inputMoveVector()
+        if camera and input then
+            direction = camera.CFrame.RightVector * input.X - camera.CFrame.LookVector * input.Z
+        end
+        direction = direction.Magnitude > 0.001 and direction.Unit * Config.FlightSpeed or Vector3.zero
+    else
+        H.claim(ctx.humanoid, "PlatformStand", true, "mover")
+        H.noclip("mover", true)
+        local speed = S.flags.run and S.runSpeed or ctx.humanoid.WalkSpeed
+        direction = H.skywalkDirection()
+        if direction.Magnitude > 0.01 and S.mover.orientation then
+            S.mover.orientation.CFrame = CFrame.lookAt(Vector3.zero, direction)
+        end
+        direction = Vector3.new(direction.X * speed,
+            math.clamp((S.hoverY - ctx.root.Position.Y) * 8, -40, 80), direction.Z * speed)
+        ctx.root.AssemblyAngularVelocity = Vector3.zero
+    end
+    S.mover.velocity.VectorVelocity = direction
+end
+
+-- Shield against locally simulated flings without freezing ordinary movement.
+-- While truly idle on stable ground, anchor only the root assembly (not every
+-- limb: anchoring all limbs splits physical assemblies and breaks animations).
+function H.releaseFlingHold(grace)
+    if S.flingHoldTarget then
+        H.release("fling_hold")
+        S.flingHoldTarget = nil
+    end
+    if grace and grace > 0 then
+        S.flingPauseUntil = math.max(S.flingPauseUntil, os.clock() + grace)
+    end
+end
+
+function H.flingMovementInput(ctx)
+    local now = os.clock()
+    local input = H.inputMoveVector()
+    local synthetic = S.afkPulseUntil ~= nil or now < S.afkPostPulseUntil
+    return now < S.flingInputUntil or (input and input.Magnitude > 0.06)
+        or (not synthetic and ctx.humanoid.MoveDirection.Magnitude > 0.06)
+        or ctx.humanoid.Jump == true
+end
+
+function H.flingCanOperate(ctx)
+    -- Important: never fight Lock On's temporary escape, voluntary flight,
+    -- hover, teleporting, or another feature's movement constraint.
+    return S.flags.fling and not S.flags.lock and not S.escape
+        and not S.mover and not S.flying and not S.hovering
+        and ctx.character:GetAttribute("ProtectionAllowHighVelocity") ~= true
+end
+
+function H.flingRestore(reason, fallback)
+    local ctx = S.context
+    if not ctx or S.flingRecovering then return end
+    S.flingRecovering = true
+    local ok, message = pcall(function()
+        -- Cooldowns limit notices; every detected impulse is neutralized.
+        H.zeroRigVelocity()
+        H.recoverRagdoll()
+        local now = os.clock()
+        local target = fallback
+        if not target and S.flingLastStableCF
+            and now - S.flingLastStableAt <= Config.FlingGroundSnapshotAge then
+            target = S.flingLastStableCF
+        end
+        if H.allowFlingPositionRestore() and target and H.finiteVector(target.Position)
+            and (ctx.root.Position - target.Position).Magnitude < 38
+            and H.safeDestination(target) then
+            H.moveRoot(target)
+        end
+        if now - S.lastFlingRecovery >= 1 then
+            S.lastFlingRecovery = now
+            H.notice("Anti-Fling: " .. tostring(reason) .. " corrected locally", 2)
+        end
+    end)
+    S.flingSnapshot = nil
+    S.flingRecovering = false
+    if not ok then H.report("Anti-Fling recovery", message) end
+end
+
+function H.updateFling(phase, deltaTime)
+    if not H.ready() or not (S.flags.fling or S.flags.lock) then
+        H.releaseFlingHold()
+        return
+    end
+    local ctx = S.context
+    local humanoid, root = ctx.humanoid, ctx.root
+    -- Capture the forced state BEFORE recovery changes it to GettingUp;
+    -- otherwise the high-priority position correction can be skipped.
+    local stateBefore = humanoid:GetState()
+    local wasForced = stateBefore == Enum.HumanoidStateType.Ragdoll
+        or stateBefore == Enum.HumanoidStateType.Physics
+        or stateBefore == Enum.HumanoidStateType.FallingDown
+        or stateBefore == Enum.HumanoidStateType.PlatformStanding
+        or humanoid.PlatformStand or humanoid.Sit
+    H.recoverRagdoll()
+    if not H.flingCanOperate(ctx) then
+        H.releaseFlingHold()
+        S.flingSnapshot = nil
+        return
+    end
+
+    local now = os.clock()
+    local state = humanoid:GetState()
+    local forcedState = wasForced or state == Enum.HumanoidStateType.Ragdoll
+        or state == Enum.HumanoidStateType.Physics
+        or state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.PlatformStanding
+        or humanoid.PlatformStand or humanoid.Sit
+    local hasInput = H.flingMovementInput(ctx)
+    local grounded, movingPlatform = H.idleGroundInfo(ctx)
+    local canHold = now >= S.flingPauseUntil and not hasInput
+        and not forcedState and grounded and not movingPlatform
+        and not S.flags.noclip and not S.flying and not S.hovering
+        and state ~= Enum.HumanoidStateType.Jumping
+        and state ~= Enum.HumanoidStateType.Climbing
+        and state ~= Enum.HumanoidStateType.Swimming
+        and state ~= Enum.HumanoidStateType.Seated
+        and not (S.flags.afk and S.idleTarget) -- AFK Streak owns that hold
+
+    if S.flingHoldTarget then
+        if not canHold then
+            H.releaseFlingHold(hasInput and Config.FlingInputReleaseGrace or nil)
+        else
+            -- Keep the same exact place even during light repeated contact.
+            H.claim(root, "Anchored", true, "fling_hold")
+            if (root.Position - S.flingHoldTarget.Position).Magnitude > 0.08 then
+                H.moveRoot(S.flingHoldTarget)
+            end
+            H.zeroRigVelocity()
+            S.flingSnapshot = nil
+            return
+        end
+    end
+
+    local linear, angular = root.AssemblyLinearVelocity, root.AssemblyAngularVelocity
+    local finite = H.finiteVector(linear) and H.finiteVector(angular)
+    local bad = not finite
+    if finite then
+        if not H.flingVelocityAllowed(linear, ctx) or angular.Magnitude > Config.FlingAngularThreshold then
+            bad = true
+        end
+    end
+    -- Check parts as well as the root: constraints can transfer a fling through
+    -- the limbs while the root still reports an ordinary velocity.
+    if not bad then
+        for _, part in ipairs(ctx.character:GetChildren()) do
+            if part:IsA("BasePart") and BODY_PART_NAMES[part.Name] then
+                local v, w = part.AssemblyLinearVelocity, part.AssemblyAngularVelocity
+                if not H.finiteVector(v) or not H.finiteVector(w)
+                    or not H.flingVelocityAllowed(v, ctx) or w.Magnitude > Config.FlingAngularThreshold then
+                    bad = true
+                    break
+                end
+            end
+        end
+    end
+    local previous = S.flingSnapshot
+    if not bad and phase == "post" and previous and finite then
+        local dt = math.clamp(deltaTime or 1 / 60, 1 / 240, 0.12)
+        local velocityJump = (linear - previous.velocity).Magnitude
+        -- Ignore large acceleration if controlled movement is already ongoing,
+        -- but never ignore extreme spins / impulses in avatar body parts.
+        if not hasInput and not humanoid.Jump and velocityJump > Config.FlingImpulseDeltaThreshold
+            and not H.isAuthorizedJumpImpulse(ctx, linear, previous.velocity) then
+            bad = true
+        elseif not H.flingDisplacementAllowed(ctx, root.Position - previous.cframe.Position,
+            linear, previous.velocity, dt) then
+            bad = true
+        end
+    end
+    if bad or forcedState then
+        H.flingRestore(forcedState and "ragdoll" or "unexpected impulse",
+            previous and previous.cframe or nil)
+        return
+    end
+
+    if phase == "pre" then
+        -- The most recent pre-physics pose is our safest non-lagging recovery
+        -- point. Do not copy an already violent velocity into the snapshot.
+        S.flingSnapshot = {cframe = root.CFrame, velocity = linear}
+        if grounded and not movingPlatform then
+            S.flingLastStableCF = root.CFrame
+            S.flingLastStableAt = now
+        end
+        -- Idle hold engages immediately once ground and low movement are
+        -- verified. Releasing it happens before the next physics step.
+        if canHold and not root.Anchored and finite then
+            local flat = Vector3.new(linear.X, 0, linear.Z).Magnitude
+            if flat <= Config.FlingStationaryMaxSpeed
+                and math.abs(linear.Y) <= Config.FlingStationaryMaxVertical then
+                S.flingHoldTarget = root.CFrame
+                H.claim(root, "Anchored", true, "fling_hold")
+                H.zeroRigVelocity()
+                S.flingSnapshot = nil
+            end
+        end
+    elseif phase == "post" then
+        S.flingSnapshot = nil
+    end
+end
+
+-- AFK Streak combines stable position hold with the original 18-second local
+-- movement pulse. The single AFK switch owns both behaviors. Never anchor
+-- when moving, jumping, flying, locked, teleporting, or on a moving platform.
+function H.releaseIdle(grace, keepTarget)
+    H.release("idle")
+    if not keepTarget then
+        S.idleTarget, S.idleSince, S.idleSample = nil, nil, nil
+    end
+    if grace then
+        S.idleBlockedUntil = os.clock() + Config.IdleInputGrace
+    end
+end
+
+function H.idleGroundInfo(ctx)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {ctx.character}
+    params.RespectCanCollide = true
+    local height = math.max(3.5, ctx.humanoid.HipHeight + ctx.root.Size.Y * 0.5 + 1.5)
+    local hit = Workspace:Raycast(ctx.root.Position, Vector3.new(0, -height, 0), params)
+    if not hit or hit.Normal.Y < 0.45 then return false, false end
+    if hit.Instance:IsA("BasePart") then
+        local velocity = hit.Instance.AssemblyLinearVelocity
+        if not H.finiteVector(velocity) then return false, false end
+        return true, velocity.Magnitude > Config.IdleMovingPlatformSpeed
+    end
+    return true, false -- Terrain is stationary.
+end
+
+function H.updateAFK()
+    if not S.flags.afk or not H.ready() then
+        H.releaseIdle(false)
+        S.afkPulseUntil = nil
+        return
+    end
+
+    local ctx = S.context
+    local now = os.clock()
+    local humanoid = ctx.humanoid
+    local state = humanoid:GetState()
+    local input = H.inputMoveVector()
+    -- During and briefly after our own pulse, MoveDirection reflects the
+    -- synthetic Move() call, not necessarily actual player input.
+    local synthetic = S.afkPulseUntil ~= nil or now < S.afkPostPulseUntil
+    local playerMoving = (input and input.Magnitude > 0.06)
+        or (not synthetic and humanoid.MoveDirection.Magnitude > 0.06)
+    local grounded, movingPlatform = H.idleGroundInfo(ctx)
+    local unavailable = playerMoving or humanoid.Jump or humanoid.Sit
+        or humanoid.PlatformStand or state == Enum.HumanoidStateType.Jumping
+        or state == Enum.HumanoidStateType.Ragdoll
+        or state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.PlatformStanding
+        or (state == Enum.HumanoidStateType.Freefall and not grounded)
+        or not grounded or movingPlatform
+        or S.flags.lock or S.escape ~= nil or S.mover ~= nil
+        or S.flying or S.hovering
+
+    if unavailable then
+        if S.afkPulseUntil then humanoid:Move(Vector3.zero, false) end
+        S.afkPulseUntil = nil
+        S.afkPostPulseUntil = -math.huge
+        S.afkLastPulse = now
+        H.releaseIdle(playerMoving or humanoid.Jump)
+        return
+    end
+
+    -- Keep the exact held CFrame during the brief activity pulse. Previously
+    -- resetting the target here caused intermittent drift and failed re-arming.
+    if S.afkPulseUntil then
+        if now >= S.afkPulseUntil then
+            humanoid:Move(Vector3.zero, false)
+            S.afkPulseUntil = nil
+            S.afkPostPulseUntil = now + Config.IdleInputGrace
+            H.releaseIdle(true, true)
+        else
+            humanoid:Move(Vector3.new(0, 0, Config.AFKMovementPulse), false)
+        end
+        return
+    end
+
+    if S.idleTarget and now - S.afkLastPulse >= Config.AFKPulsingInterval then
+        H.releaseIdle(false, true) -- unanchor temporarily, keep original position
+        S.afkLastPulse = now
+        S.afkPulseUntil = now + Config.AFKPulsingDuration
+        humanoid:Move(Vector3.new(0, 0, Config.AFKMovementPulse), false)
+        return
+    end
+
+    if now < S.idleBlockedUntil then
+        H.release("idle") -- cooldown must not erase the pre-pulse destination
+        return
+    end
+
+    if not S.idleTarget then
+        local velocity = ctx.root.AssemblyLinearVelocity
+        if not H.finiteVector(velocity) then H.releaseIdle(false); return end
+        local planarSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+        if planarSpeed > Config.IdleMaxHorizontalSpeed then
+            S.idleSample, S.idleSince = nil, nil
+            return
+        end
+        local position = ctx.root.Position
+        if not S.idleSample or (position - S.idleSample).Magnitude > Config.IdleSettleRadius then
+            S.idleSample, S.idleSince = position, now
+            return
+        end
+        if now - (S.idleSince or now) < Config.IdleSettleTime then return end
+        S.idleTarget = ctx.root.CFrame
+        S.afkLastPulse = now -- start 18 seconds after successfully becoming idle
+    end
+
+    -- Anchor only while genuinely idle. Do not keep resetting the target if
+    -- minor physics jitter or the AFK pulse has displaced the player slightly.
+    H.claim(ctx.root, "Anchored", true, "idle")
+    if (ctx.root.Position - S.idleTarget.Position).Magnitude > 0.35 then
+        H.moveRoot(S.idleTarget)
+    end
+    H.zeroVelocity()
+end
+
+function H.applyCollision()
+    if S.flags.noclip then H.noclip("noclip", true) end
+end
+
+function H.teleport(target, label)
+    if not H.ready() or typeof(target) ~= "CFrame" or not H.finiteVector(target.Position) then
+        H.notice("Teleport failed: character or destination unavailable", 4)
+        return false
+    end
+    local chosen
+    for _, lift in ipairs(Config.ManualTeleportLiftSteps) do
+        local candidate = target + Vector3.new(0, lift, 0)
+        if H.safeDestination(candidate) then chosen = candidate; break end
+    end
+    if not chosen then
+        H.notice("Teleport blocked: destination obstructed or unsafe", 5)
+        return false
+    end
+    H.stopMover()
+    H.releaseIdle(true)
+    H.releaseFlingHold(0.9)
+    S.flingSnapshot = nil
+    S.afkPulseUntil = nil
+    S.afkPostPulseUntil = -math.huge
+    S.afkLastPulse = os.clock()
+    local oldLock, oldEscape = S.lockTarget, S.escape
+    if S.flags.lock then
+        if not H.beginEscapeMove(chosen, "manual", chosen, label) then
+            S.lockTarget, S.escape = oldLock, oldEscape
+            H.notice("Teleport move failed", 4)
+            return false
+        end
+        S.damageEvents, S.impactEntries = {}, {}
+    elseif not H.moveRoot(chosen) then
+        H.notice("Teleport move failed", 4)
+        return false
+    end
+    S.safeRoot, S.safeTime = chosen, os.clock()
+    H.notice("TP to " .. tostring(label or "destination") .. " requested", 3)
+    local ctx = S.context
+    task.delay(0.75, function()
+        if S.alive and ctx == S.context and ctx.root.Parent
+            and (ctx.root.Position - chosen.Position).Magnitude > 16 then
+            H.notice("Server may be correcting client-only teleport", 5)
+        end
+    end)
+    return true
+end
+
+local function eligibleSpawn(inst)
+    return inst and inst:IsA("SpawnLocation") and inst.Enabled
+        and inst:IsDescendantOf(Workspace)
+        and (inst.Neutral or inst.TeamColor == player.TeamColor)
+end
+
+function H.findJoinSpawn()
+    -- RespawnLocation is an explicit server-selected spawn where available.
+    if eligibleSpawn(player.RespawnLocation) then return player.RespawnLocation end
+    if eligibleSpawn(S.joinSpawn) then return S.joinSpawn end
+    -- For maps without RespawnLocation, use the spawn nearest to the position
+    -- first observed when this panel was started, not the player's current spot.
+    local origin = S.entrySpawn and S.entrySpawn.Position
+        or (H.ready() and S.context.root.Position)
+    if not origin then return nil end
+    local closest, bestDistance
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if eligibleSpawn(inst) then
+            local distance = (inst.Position - origin).Magnitude
+            if not bestDistance or distance < bestDistance then
+                closest, bestDistance = inst, distance
+            end
+        end
+    end
+    return closest
+end
+
+function H.spawnRootTarget(spawn)
+    if not H.ready() or not eligibleSpawn(spawn) then return nil end
+    local root = S.context.root
+    local humanoid = S.context.humanoid
+    local height = spawn.Size.Y * 0.5 + humanoid.HipHeight + root.Size.Y * 0.5 + 0.8
+    return CFrame.new(spawn.Position + spawn.CFrame.UpVector * height)
+        * (root.CFrame - root.Position)
+end
+
+function H.updateSwitches()
+    for key, switch in pairs(S.switches) do
+        local enabled = S.flags[key]
+        switch.button.BackgroundColor3 = enabled and Color3.fromRGB(42, 176, 117) or Color3.fromRGB(48, 50, 61)
+        switch.knob.Position = enabled and UDim2.new(1, -18, 0.5, -7) or UDim2.new(0, 4, 0.5, -7)
+    end
+end
+
+Config.RunAcceleration = 90
+Config.RunDeceleration = 140
+Config.RunCorrectionWindow = 4
+Config.RunCorrectionCount = 3
+Config.RunCorrectionPause = 4
+Config.RunCorrectionCapDuration = 16
+Config.RunReleaseGrace = 0.8
+Config.HealthTickInterval = 0.15
+Config.HealthDamageDelay = 0.8
+Config.HealthRatePerSecond = 8
+Config.HealthFractionPerSecond = 0.08
+Config.HealthMaxStep = 2
+Config.MinJumpPower = 0
+Config.MaxJumpPower = 200
+S.jumpPower = S.jumpPower or 50
+
+function H.resetRunObservation()
+    S.runObservation = nil
+    S.runCorrectionEvents = {}
+end
+
+function H.resetMovementHealth()
+    H.release("jump")
+    H.release("run")
+    H.resetRunObservation()
+    S.runCommandSpeed = nil
+    S.runAppliedSpeed, S.runBackoffUntil, S.runSpeedCap, S.runCapUntil = nil, nil, nil, nil
+    S.runAuthorizedSpeed, S.runAuthorizedUntil, S.runExternalCorrectionUntil = nil, nil, nil
+    S.jumpAuthorizedUntil, S.jumpAuthorizedPower = nil, nil
+    S.healthLastTick, S.healthNextWrite, S.healthStatus = nil, nil, nil
+    S.healing = false
+end
+
+function H.updateHealthRecovery(deltaTime)
+    local now = os.clock()
+    if not S.flags.health or not H.ready() then
+        S.healthLastTick, S.healthNextWrite, S.healthStatus = nil, nil, nil
+        return false
+    end
+    local humanoid = S.context.humanoid
+    local health, maximum = humanoid.Health, humanoid.MaxHealth
+    if not H.finite(health) or not H.finite(maximum) or maximum <= 0 or health <= 0 then
+        return false -- A local health write must never attempt to revive a dead rig.
+    end
+    if health >= maximum then
+        S.healthLastTick = now
+        S.healthStatus = "Full health"
+        return false
+    end
+    if now - S.lastDamageAt < Config.HealthDamageDelay then
+        S.healthLastTick = now
+        S.healthStatus = "Recovery waiting after damage"
+        return false
+    end
+    if now < (S.healthNextWrite or -math.huge) then return false end
+    local elapsed = math.clamp(now - (S.healthLastTick or now - Config.HealthTickInterval), 0, 0.25)
+    S.healthLastTick = now
+    S.healthNextWrite = now + Config.HealthTickInterval
+    local rate = math.min(Config.HealthRatePerSecond, maximum * Config.HealthFractionPerSecond)
+    local increment = math.min(Config.HealthMaxStep, rate * elapsed, maximum - health)
+    if increment <= 0 then return false end
+    S.healing = true
+    local ok, message = pcall(function() humanoid.Health = math.min(maximum, health + increment) end)
+    S.healing = false
+    if not ok then
+        S.healthNextWrite = now + 5
+        S.healthStatus = "Local recovery unavailable"
+        H.report("Local health recovery", message)
+        return false
+    end
+    S.healthStatus = "Local recovery; server controls actual HP"
+    return true
+end
+
+function H.noteCustomJump()
+    if not S.flags.jump or not H.ready() then return end
+    local power = math.clamp(S.jumpPower, Config.MinJumpPower, Config.MaxJumpPower)
+    local gravity = math.max(1, Workspace.Gravity)
+    S.jumpAuthorizedPower = power
+    S.jumpAuthorizedUntil = os.clock() + math.min(15, power * 2 / gravity + 0.75)
+end
+
+function H.applyCustomJump()
+    if not S.flags.jump or not H.ready() then H.release("jump"); return false end
+    local humanoid = S.context.humanoid
+    local power = math.clamp(S.jumpPower, Config.MinJumpPower, Config.MaxJumpPower)
+    H.claim(humanoid, "UseJumpPower", true, "jump")
+    H.claim(humanoid, "JumpPower", power, "jump")
+    if humanoid.Jump or humanoid:GetState() == Enum.HumanoidStateType.Jumping then
+        H.noteCustomJump()
+    end
+    return true
+end
+
+function H.nativeWalkSpeed(ctx)
+    local fields = S.properties[ctx.humanoid]
+    local lease = fields and fields.WalkSpeed
+    local speed = lease and lease.owners.run and lease.original or ctx.humanoid.WalkSpeed
+    return H.finite(speed) and math.max(0, speed) or 16
+end
+
+function H.effectiveRunSpeed(ctx)
+    local speed = S.runSpeed
+    if S.runSpeedCap and os.clock() < (S.runCapUntil or -math.huge) then
+        speed = math.min(speed, math.max(H.nativeWalkSpeed(ctx), S.runSpeedCap))
+    end
+    return speed
+end
+
+function H.runCanOperate(ctx)
+    return S.flags.run and not S.flags.lock and not S.escape and not S.mover
+        and not S.flying and not S.hovering and not ctx.root.Anchored
+        and not ctx.humanoid.Sit and not ctx.humanoid.PlatformStand
+end
+
+function H.observeRunCorrection(deltaTime)
+    if not H.ready() then
+        H.release("run")
+        S.runCommandSpeed, S.runAppliedSpeed = nil, nil
+        H.resetRunObservation()
+        return false
+    end
+    local ctx, now = S.context, os.clock()
+    if not H.runCanOperate(ctx) then
+        H.release("run")
+        S.runCommandSpeed, S.runAppliedSpeed = nil, nil
+        H.resetRunObservation()
+        return false
+    end
+    if now - S.lastDrop < 0.6 then
+        H.resetRunObservation()
+        return false
+    end
+    local previous = S.runObservation
+    S.runObservation = nil
+    if not previous or S.runSpeed <= H.nativeWalkSpeed(ctx) + 5 then return false end
+    local dt = H.finite(deltaTime) and math.clamp(deltaTime, 0, 0.12) or 1 / 60
+    local offset = ctx.root.Position - previous.position
+    offset = Vector3.new(offset.X, 0, offset.Z)
+    local tolerance = math.max(8, previous.velocity.Magnitude * dt * 1.5 + 3)
+    -- A correction is only suspected when a large inter-frame movement goes
+    -- backward, or is far beyond normal travel. Collisions/teleports may also
+    -- cause it, so the response yields movement instead of claiming a server cause.
+    local backwards = offset:Dot(previous.velocity) < -3 * previous.velocity.Magnitude
+    if not H.finiteVector(offset) or offset.Magnitude <= tolerance
+        or (not backwards and offset.Magnitude <= tolerance * 2) then return false end
+    S.runExternalCorrectionUntil = now + 0.35
+    S.runCorrectionEvents = S.runCorrectionEvents or {}
+    for i = #S.runCorrectionEvents, 1, -1 do
+        if now - S.runCorrectionEvents[i] > Config.RunCorrectionWindow then
+            table.remove(S.runCorrectionEvents, i)
+        end
+    end
+    table.insert(S.runCorrectionEvents, now)
+    if #S.runCorrectionEvents < Config.RunCorrectionCount then return false end
+    local normalSpeed = H.nativeWalkSpeed(ctx)
+    local currentCap = H.effectiveRunSpeed(ctx)
+    S.runSpeedCap = math.max(normalSpeed, math.min(normalSpeed * 2, currentCap * 0.6))
+    S.runCapUntil = now + Config.RunCorrectionCapDuration
+    S.runBackoffUntil = now + Config.RunCorrectionPause
+    H.release("run")
+    S.runCommandSpeed, S.runAppliedSpeed = nil, nil
+    S.runCorrectionEvents = {}
+    H.releaseFlingHold(Config.RunCorrectionPause)
+    S.flingSnapshot = nil
+    H.notice("Run paused after repeated external position changes; speed reduced temporarily", 5)
+    return true
+end
+
+function H.recordRunPosition()
+    if not H.ready() or not H.runCanOperate(S.context) then
+        S.runObservation = nil
+        return
+    end
+    local root = S.context.root
+    local velocity = root.AssemblyLinearVelocity
+    if H.finiteVector(root.Position) and H.finiteVector(velocity) then
+        S.runObservation = {position = root.Position, velocity = Vector3.new(velocity.X, 0, velocity.Z)}
+    else S.runObservation = nil end
+end
+
+function H.updateRun(deltaTime)
+    if not H.ready() then
+        H.release("run")
+        S.runCommandSpeed, S.runAppliedSpeed = nil, nil
+        return false
+    end
+    local ctx, now = S.context, os.clock()
+    if not H.runCanOperate(ctx) or now < (S.runBackoffUntil or -math.huge) then
+        H.release("run")
+        S.runCommandSpeed, S.runAppliedSpeed = nil, nil
+        return false
+    end
+    local direction = ctx.humanoid.MoveDirection
+    direction = Vector3.new(direction.X, 0, direction.Z)
+    if not H.finiteVector(direction) or direction.Magnitude <= 0.01 then
+        H.release("run")
+        S.runCommandSpeed, S.runAppliedSpeed = nil, nil
+        return false
+    end
+    if direction.Magnitude > 1 then direction = direction.Unit end
+    local velocity = ctx.root.AssemblyLinearVelocity
+    if not H.finiteVector(velocity) then
+        H.release("run")
+        S.runCommandSpeed, S.runAppliedSpeed = nil, nil
+        return false
+    end
+    local dt = H.finite(deltaTime) and math.clamp(deltaTime, 0, 0.1) or 1 / 60
+    if dt <= 0 then return false end
+    local command = S.runCommandSpeed or H.nativeWalkSpeed(ctx)
+    local selected = H.effectiveRunSpeed(ctx)
+    local commandRate = selected < command and Config.RunDeceleration or Config.RunAcceleration
+    command += math.clamp(selected - command, -commandRate * dt, commandRate * dt)
+    S.runCommandSpeed = command
+    -- The normal Humanoid motor must target the same gradual speed, rather
+    -- than braking every client velocity write back toward its native speed.
+    H.claim(ctx.humanoid, "WalkSpeed", command, "run")
+    local current = Vector3.new(velocity.X, 0, velocity.Z)
+    local target = direction * command
+    local change = target - current
+    local rate = change:Dot(current) < 0 and Config.RunDeceleration or Config.RunAcceleration
+    local step = rate * dt
+    if change.Magnitude > step then change = change.Unit * step end
+    local updated = current + change
+    ctx.root.AssemblyLinearVelocity = Vector3.new(updated.X, velocity.Y, updated.Z)
+    S.runAppliedSpeed = updated.Magnitude
+    S.runAuthorizedSpeed = updated.Magnitude
+    S.runAuthorizedUntil = now + Config.RunReleaseGrace
+    return true
+end
+
+function H.allowFlingPositionRestore()
+    local now = os.clock()
+    return now >= (S.runExternalCorrectionUntil or -math.huge)
+        and now >= (S.runBackoffUntil or -math.huge)
+end
+
+function H.authorizePhysicsVelocity()
+    if not S.flingSnapshot or not H.ready() then return end
+    local velocity = S.context.root.AssemblyLinearVelocity
+    if H.finiteVector(velocity) then S.flingSnapshot.velocity = velocity end
+end
+
+function H.flingVelocityAllowed(velocity, ctx)
+    if not H.finiteVector(velocity) then return false end
+    local horizontal = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
+    local horizontalLimit = math.max(Config.FlingLinearThreshold, ctx.humanoid.WalkSpeed + 30,
+        S.flags.run and (S.runAppliedSpeed or ctx.humanoid.WalkSpeed) + 30 or 0)
+    if os.clock() <= (S.runAuthorizedUntil or -math.huge) then
+        horizontalLimit = math.max(horizontalLimit, (S.runAuthorizedSpeed or 0) + 30)
+    end
+    local verticalLimit = Config.FlingLinearThreshold
+    if os.clock() <= (S.jumpAuthorizedUntil or -math.huge) then
+        verticalLimit = math.max(verticalLimit, (S.jumpAuthorizedPower or 0) + 30)
+    end
+    return horizontal <= horizontalLimit and math.abs(velocity.Y) <= verticalLimit
+end
+
+function H.isAuthorizedJumpImpulse(ctx, velocity, previousVelocity)
+    if os.clock() > (S.jumpAuthorizedUntil or -math.huge)
+        or not H.finiteVector(velocity) or not H.finiteVector(previousVelocity) then return false end
+    local change = velocity - previousVelocity
+    local horizontalChange = Vector3.new(change.X, 0, change.Z).Magnitude
+    return change.Y > 0 and velocity.Y >= 0
+        and velocity.Y <= (S.jumpAuthorizedPower or 0) + 8
+        and horizontalChange <= Config.FlingImpulseDeltaThreshold
+end
+
+function H.flingDisplacementAllowed(ctx, displacement, velocity, previousVelocity, deltaTime)
+    if not H.finiteVector(displacement) or not H.flingVelocityAllowed(velocity, ctx)
+        or not H.flingVelocityAllowed(previousVelocity, ctx) then return false end
+    local dt = H.finite(deltaTime) and math.clamp(deltaTime, 0, 0.12) or 1 / 60
+    local horizontalSpeed = math.max(ctx.humanoid.WalkSpeed,
+        Vector3.new(velocity.X, 0, velocity.Z).Magnitude,
+        Vector3.new(previousVelocity.X, 0, previousVelocity.Z).Magnitude)
+    local verticalSpeed = math.max(math.abs(velocity.Y), math.abs(previousVelocity.Y))
+    local gravity = H.finite(Workspace.Gravity) and math.max(0, Workspace.Gravity) or 196.2
+    local horizontalBudget = math.max(Config.FlingFrameDistance, horizontalSpeed * dt + 3.5)
+    local verticalBudget = math.max(Config.FlingFrameDistance,
+        verticalSpeed * dt + 0.5 * gravity * dt * dt + 3.5)
+    -- Separate budgets permit a fast legitimate jump without also authorizing
+    -- equally large horizontal teleports. Only measured authorized velocities
+    -- widen them; raising the numeric speed/jump input alone does not.
+    local horizontalDistance = Vector3.new(displacement.X, 0, displacement.Z).Magnitude
+    return horizontalDistance <= horizontalBudget and math.abs(displacement.Y) <= verticalBudget
+end
+
+
+function H.shotRaycastParams(source, excluded)
+    if source ~= nil and typeof(source) ~= "RaycastParams" then return nil end
+    local params = RaycastParams.new()
+    params.FilterType = source and source.FilterType or Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = source and table.clone(source.FilterDescendantsInstances) or {}
+    if source then
+        params.IgnoreWater = source.IgnoreWater
+        params.CollisionGroup = source.CollisionGroup
+        params.RespectCanCollide = source.RespectCanCollide
+        for _, property in ipairs({"IncludeInstances", "ExcludeInstances", "BruteForceAllSlow", "Margin", "SizeGradient"}) do
+            pcall(function()
+                local value = source[property]
+                params[property] = type(value) == "table" and table.clone(value) or value
+            end)
+        end
+    else params.RespectCanCollide = false end
+    if params.FilterType == Enum.RaycastFilterType.Exclude then
+        local filters = params.FilterDescendantsInstances
+        local character = S.context and S.context.character or player.Character
+        if character and not table.find(filters, character) then table.insert(filters, character) end
+        if excluded and not table.find(filters, excluded) then table.insert(filters, excluded) end
+        params.FilterDescendantsInstances = filters
+    end
+    -- New runtimes allow independent include and exclude lists. Exclusion wins,
+    -- so self can be excluded while retaining the gun's inclusion whitelist.
+    pcall(function()
+        local filters = params.ExcludeInstances
+        filters = type(filters) == "table" and table.clone(filters) or {}
+        local character = S.context and S.context.character or player.Character
+        if character and not table.find(filters, character) then table.insert(filters, character) end
+        if excluded and not table.find(filters, excluded) then table.insert(filters, excluded) end
+        params.ExcludeInstances = filters
+    end)
+    return params
+end
+
+function H.enemyVisible(record, origin, excluded, aim, customParams, requireHit)
+    local displacement = (aim and record.aimPosition or record.position) - origin
+    if displacement.Magnitude < 0.01 then return not requireHit end
+    local params = H.shotRaycastParams(customParams, excluded)
+    if not params then return false end
+    local hit = Workspace:Raycast(origin, displacement, params)
+    if requireHit and not hit then return false end
+    return not hit or hit.Instance == record.instance or hit.Instance:IsDescendantOf(record.instance)
+end
+
+function H.pickAimTarget(origin, camera)
+    local best, bestScore
+    local center = camera.ViewportSize * 0.5
+    for _, record in ipairs(H.scanEnemies(origin, {range = Config.AimRange, camera = true})) do
+        local point, onScreen = camera:WorldToViewportPoint(record.aimPosition)
+        local offset = Vector2.new(point.X, point.Y) - center
+        if onScreen and point.Z > 0 and offset.Magnitude <= Config.AimRadiusPixels
+            and H.enemyVisible(record, origin, nil, true) then
+            local score = offset.Magnitude + record.distance * 0.01
+            if not bestScore or score < bestScore then best, bestScore = record, score end
+        end
+    end
+    return best
+end
+
+function H.updateAim(deltaTime)
+    if not S.flags.aim or not H.ready() or UserInputService:GetFocusedTextBox() then
+        S.aimTarget = nil
+        return
+    end
+    local camera = Workspace.CurrentCamera
+    if not camera or camera.CameraType == Enum.CameraType.Scriptable then return end
+    local origin, now = camera.CFrame.Position, os.clock()
+    local record = S.aimTarget and H.enemyRecord(S.aimTarget, origin, {range = Config.AimRange, camera = true})
+    if record and not H.enemyVisible(record, origin, nil, true) then record = nil end
+    if now - S.lastAimScan >= Config.AimScanInterval then
+        record = H.pickAimTarget(origin, camera)
+        S.lastAimScan = now
+    end
+    S.aimTarget = record and record.instance or nil
+    if not record or (record.aimPosition - origin).Magnitude < 0.01 then return end
+    local alpha = 1 - math.exp(-Config.AimResponse * math.clamp(deltaTime or 1 / 60, 0, 0.1))
+    camera.CFrame = camera.CFrame:Lerp(CFrame.lookAt(origin, record.aimPosition), alpha)
+end
+
+function H.stopAim()
+    if S.aimBound then RunService:UnbindFromRenderStep(S.aimBinding) end
+    S.aimBound, S.aimTarget, S.lastAimScan = false, nil, -math.huge
+end
+
+function H.startAim()
+    H.stopAim()
+    RunService:BindToRenderStep(S.aimBinding, Enum.RenderPriority.Camera.Value + 1, function(dt)
+        local ok, message = pcall(H.updateAim, dt)
+        if not ok then
+            S.flags.aim = false
+            H.stopAim()
+            H.updateSwitches()
+            H.report("Auto Aim", message)
+        end
+    end)
+    S.aimBound = true
+end
+
+function H.guidanceTarget(origin, excluded, range, customParams, requireHit)
+    range = math.min(range or Config.BulletRange, Config.BulletRange)
+    for _, record in ipairs(H.scanEnemies(origin, {range = range, bullet = true})) do
+        if H.enemyVisible(record, origin, excluded, false, customParams, requireHit) then return record end
+    end
+    return nil
+end
+
+function H.getShotAim(origin)
+    if not S.flags.bullet or not H.ready() or typeof(origin) ~= "Vector3" or not H.finiteVector(origin) then return nil end
+    local record = H.guidanceTarget(origin)
+    if not record then return nil end
+    local offset = record.position - origin
+    if offset.Magnitude < 0.001 then return nil end
+    return record.instance, record.position, offset.Unit
+end
+
+function H.castGuidedShot(origin, ordinaryDirection, range, sourceParams)
+    if typeof(origin) ~= "Vector3" or not H.finiteVector(origin)
+        or typeof(ordinaryDirection) ~= "Vector3" or not H.finiteVector(ordinaryDirection)
+        or ordinaryDirection.Magnitude < 0.001 then return nil, nil, false, nil, "Expected finite origin and nonzero direction" end
+    range = range or Config.BulletRange
+    if not H.finite(range) or range <= 0 then return nil, nil, false, nil, "Expected positive finite shot range" end
+    local params = H.shotRaycastParams(sourceParams)
+    if not params then return nil, nil, false, nil, "Expected RaycastParams" end
+    range = math.min(range, 15000)
+    local direction, guided = ordinaryDirection.Unit, false
+    if S.flags.bullet and H.ready() then
+        local record = H.guidanceTarget(origin, nil, range, params, true)
+        if record then
+            local offset = record.position - origin
+            if offset.Magnitude > 0.001 then direction, guided = offset.Unit, true end
+        end
+    end
+    local hit = Workspace:Raycast(origin, direction * range, params)
+    local enemy
+    if hit and H.ready() then
+        local owner = H.enemyOwner(hit.Instance)
+        local record = owner and H.enemyRecord(owner, origin, {range = range, bullet = true})
+        enemy = record and record.instance or nil
+    end
+    -- Return the real collision result. The gun still handles effects and damage.
+    return hit, enemy, guided, direction
+end
+
+function H.registerShot(mode, data)
+    if type(data) ~= "table" then return {accepted = false, reason = "Expected shot data"} end
+    if mode == nil then mode = "Auto" end
+    if type(mode) ~= "string" then return {accepted = false, reason = "Expected shot mode"} end
+    mode = mode:lower()
+    if mode == "auto" then mode = data.Projectile ~= nil and "projectile" or "raycast" end
+    if mode == "raycast" or mode == "hitscan" then
+        local hit, enemy, guided, direction, reason = H.castGuidedShot(data.Origin, data.Direction, data.Range, data.RaycastParams)
+        return {mode = "Raycast", accepted = reason == nil, reason = reason,
+            hit = hit, enemy = enemy, guided = guided, direction = direction}
+    elseif mode == "projectile" then
+        local accepted, reason = H.registerBullet(data.Projectile, data.ProjectileOptions or data)
+        return {mode = "Projectile", accepted = accepted, guided = accepted, reason = reason,
+            projectile = data.Projectile}
+    end
+    return {accepted = false, reason = "Supported shot modes: Auto, Raycast, Projectile"}
+end
+
+function H.bulletOwner(part)
+    local current = part
+    while current and current ~= Workspace do
+        for _, attribute in ipairs({"OwnerUserId", "ShooterUserId", "CreatorUserId"}) do
+            local id = current:GetAttribute(attribute)
+            if id ~= nil then return tostring(id) end
+        end
+        for _, name in ipairs({"creator", "Creator", "Owner", "Shooter"}) do
+            local value = current:FindFirstChild(name)
+            if value and value:IsA("ObjectValue") and value.Value then
+                if value.Value:IsA("Player") then return tostring(value.Value.UserId) end
+                local owner = value.Value:IsA("Model") and Players:GetPlayerFromCharacter(value.Value)
+                if owner then return tostring(owner.UserId) end
+            end
+        end
+        if current:IsA("Model") then
+            local owner = Players:GetPlayerFromCharacter(current)
+            if owner then return tostring(owner.UserId) end
+        end
+        current = current.Parent
+    end
+    return nil
+end
+
+function H.registerBullet(part, options)
+    if not S.flags.bullet or not H.ready() then return false, "Bullet Aim is off" end
+    if typeof(part) ~= "Instance" or not part:IsA("BasePart") or not part:IsDescendantOf(Workspace)
+        or part:IsDescendantOf(S.context.character) then return false, "Expected a projectile in Workspace" end
+    if options ~= nil and type(options) ~= "table" then return false, "Expected projectile options" end
+    options = options or {}
+    local owner = H.bulletOwner(part)
+    if owner and owner ~= tostring(player.UserId) then return false, "Projectile belongs to another player" end
+    if part.Anchored and options.MoveAnchored ~= true then return false, "Anchored projectile needs explicit movement support" end
+    if S.guidedBullets[part] then return true end
+    local speed = options.Speed or part.AssemblyLinearVelocity.Magnitude
+    if not H.finite(speed) or speed < 1 then speed = Config.BulletSpeed end
+    local lifetime = options.Lifetime or Config.BulletLifetime
+    if not H.finite(lifetime) then return false, "Expected finite projectile lifetime" end
+    S.guidedBullets[part] = {speed = math.clamp(speed, 1, 3000),
+        expiresAt = os.clock() + math.clamp(lifetime, 0.05, 30),
+        lastPosition = part.Position, traveled = 0, target = nil, lastScan = -math.huge,
+        moveAnchored = options.MoveAnchored == true,
+        destroyOnHit = options.DestroyOnHit == true,
+        onHit = type(options.OnHit) == "function" and options.OnHit or nil}
+    return true
+end
+
+function H.tryRegisterBullet(part)
+    if not S.flags.bullet or not part:IsA("BasePart") or part:GetAttribute("GR33D_GuidedBullet") ~= true then return end
+    if H.bulletOwner(part) ~= tostring(player.UserId) then return end
+    H.registerBullet(part)
+end
+
+function H.guidedHit(part, state, hit, record)
+    S.guidedBullets[part] = nil
+    local target
+    local owner = H.enemyOwner(hit.Instance)
+    local current = owner and H.enemyRecord(owner, hit.Position, {range = Config.BulletRange, bullet = true})
+    target = current and current.instance or nil
+    -- The gun's hit handler retains responsibility for validated damage.
+    if S.weaponHooks.hit then S.weaponHooks.hit:Fire(part, target, hit.Position, hit.Normal) end
+    if state.onHit then
+        local ok, message = pcall(state.onHit, part, target, hit.Position, hit.Normal)
+        if not ok then H.report("Guided projectile hit handler", message) end
+    end
+    if state.destroyOnHit and part.Parent then part:Destroy() end
+end
+
+function H.updateGuidedBullets(deltaTime)
+    if not S.flags.bullet or not H.ready() then return end
+    local dt = math.clamp(deltaTime or 1 / 60, 0, 0.1)
+    local now = os.clock()
+    for part, state in pairs(S.guidedBullets) do
+        local owner = part.Parent and H.bulletOwner(part)
+        if not part:IsDescendantOf(Workspace) or now >= state.expiresAt
+            or (owner and owner ~= tostring(player.UserId)) or not H.finiteVector(part.Position) then
+            S.guidedBullets[part] = nil
+        else
+            local position = part.Position
+            state.traveled = state.traveled + (position - state.lastPosition).Magnitude
+            if state.traveled > Config.BulletMaxTravel then
+                S.guidedBullets[part] = nil
+            else
+                local record = state.target and H.enemyRecord(state.target, position,
+                    {range = Config.BulletRange, bullet = true})
+                if record and not H.enemyVisible(record, position, part) then record = nil end
+                if not record and now - state.lastScan >= Config.AimScanInterval then
+                    record = H.guidanceTarget(position, part)
+                    state.lastScan = now
+                end
+                state.target = record and record.instance or nil
+                local params = RaycastParams.new()
+                params.FilterType = Enum.RaycastFilterType.Exclude
+                params.FilterDescendantsInstances = {S.context.character, part}
+                params.RespectCanCollide = false
+                local traveled = position - state.lastPosition
+                local hit = traveled.Magnitude > 0.001 and Workspace:Raycast(state.lastPosition, traveled, params) or nil
+                if hit then H.guidedHit(part, state, hit, record) else
+                    state.lastPosition = position
+                    if record then
+                        local offset = record.position - position
+                        if offset.Magnitude > 0.001 then
+                            local direction = offset.Unit
+                            local step = direction * math.min(state.speed * dt, offset.Magnitude)
+                            local nextHit = step.Magnitude > 0.001 and Workspace:Raycast(position, step, params) or nil
+                            if nextHit then H.guidedHit(part, state, nextHit, record)
+                            elseif part.Anchored and state.moveAnchored then
+                                part.CFrame = CFrame.lookAt(position + step, position + step + direction)
+                            elseif not part.Anchored then
+                                part.AssemblyLinearVelocity = direction * state.speed
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+function H.stopBulletAim()
+    S.guidedBullets = {}
+end
+
+function H.primeEnemyIndex()
+    for _, instance in ipairs(Workspace:GetDescendants()) do
+        if H.npcCandidate(instance) then S.npcs[instance] = true end
+        if instance:IsA("Model") or instance:IsA("Folder") or instance:IsA("Humanoid")
+            or instance:IsA("AnimationController") or instance:IsA("ObjectValue")
+            or instance:IsA("BoolValue") or instance:IsA("StringValue")
+            or instance:IsA("NumberValue") or instance:IsA("IntValue") then H.watchObject(instance) end
+        if S.flags.bullet and instance:IsA("BasePart") then H.tryRegisterBullet(instance) end
+    end
+end
+
+function H.primeHazardIndex()
+    -- Candidate discovery must precede the map's background watcher queue.
+    for _, instance in ipairs(Workspace:GetDescendants()) do
+        if H.hazardCandidate(instance) then H.watchObject(instance) end
+    end
+    S.hazardCache, S.lastProtectionScanAt = nil, -math.huge
+end
+
+function H.setToggle(key, enabled)
+    if not S.alive or S.flags[key] == nil then return false end
+    enabled = enabled == true
+    if S.flags[key] == enabled then return true end
+    if enabled and not H.ready() then H.notice("Wait for a living character", 4); return false end
+    if enabled then
+        -- AFK Streak is independent of flight and Lock On; it pauses its hold
+        -- during either feature and resumes when normal idle movement returns.
+        local conflicts = {lock = {"flight", "monster"}, flight = {"lock", "monster"},
+            monster = {"lock", "flight"}}
+        for _, other in ipairs(conflicts[key] or {}) do H.setToggle(other, false) end
+    end
+    S.flags[key] = enabled
+    local ok, message = pcall(function()
+        if key == "lock" then
+            if enabled then
+                H.releaseIdle(true)
+                H.releaseFlingHold(Config.IdleInputGrace)
+                H.stopEscapeHold()
+                S.lockSuspended = false
+                S.lockTarget, S.escape, S.lastEscape = S.context.root.CFrame, nil, -math.huge
+                S.lastChaseRelocate, S.lastChaseThreatAt = -math.huge, -math.huge
+                S.escapeHistory = {}
+                H.primeHazardIndex()
+                H.applyLock()
+                H.updateEscape()
+            else H.stopLock(true) end
+        elseif key == "flight" then
+            if not enabled then H.stopMover() end
+            if enabled then H.notice("Flight armed: double-tap jump to fly", 4) end
+        elseif key == "monster" then
+            if enabled then
+                -- Prioritize existing monsters before the rest of a large map's
+                -- batched hazard index. New descendants still use the normal queue.
+                H.primeEnemyIndex()
+                S.lastNPCLift = -math.huge
+                H.updateNPCs()
+            else H.endHover(true) end
+        elseif key == "noclip" then
+            if enabled then H.noclip("noclip", true) else H.release("noclip") end
+        elseif key == "fling" then
+            if enabled then
+                S.flingSnapshot = nil
+                S.flingLastStableCF = S.context.root.CFrame
+                S.flingLastStableAt = os.clock()
+                S.flingPauseUntil = os.clock() + 0.1
+                H.recoverRagdoll()
+            else
+                H.releaseFlingHold()
+                H.release("fling")
+                S.flingSnapshot = nil
+            end
+        elseif key == "afk" then
+            if S.afkPulseUntil and H.ready() then
+                S.context.humanoid:Move(Vector3.zero, false)
+            end
+            H.releaseIdle(true)
+            S.afkLastPulse, S.afkPulseUntil = os.clock(), nil
+            S.afkPostPulseUntil = -math.huge
+            if enabled then H.notice("AFK Streak on: hold when idle + periodic pulse", 4) end
+        elseif key == "run" then
+            H.resetRunObservation()
+            if enabled then H.notice("Run speed ramps smoothly; repeated corrections pause the override", 4)
+            else H.release("run"); S.runCommandSpeed, S.runAppliedSpeed = nil, nil end
+        elseif key == "jump" then
+            if enabled then H.applyCustomJump() else H.release("jump") end
+        elseif key == "health" then
+            S.healthLastTick, S.healthNextWrite = nil, nil
+            if enabled then
+                H.updateHealthRecovery()
+                H.notice("Health regeneration enabled; server controls actual HP", 4)
+            else S.healthStatus = nil end
+        elseif key == "aim" then
+            if enabled then H.primeEnemyIndex(); H.startAim() else H.stopAim() end
+        elseif key == "bullet" then
+            if enabled then
+                H.primeEnemyIndex()
+                H.notice("Bullet Aim ready for compatible guns; awaiting projectile or shot integration", 5)
+            else H.stopBulletAim() end
+        elseif key == "fall" and enabled then
+            H.notice("Descent limited; game-defined fall damage may still apply", 4)
+        end
+    end)
+    if not ok then
+        S.flags[key] = false
+        -- Undo partial activation, not just its visual state.
+        if key == "lock" then H.stopLock(false)
+        elseif key == "noclip" then H.release("noclip")
+        elseif key == "flight" or key == "monster" then H.stopMover()
+        elseif key == "fling" then H.releaseFlingHold(); H.release("fling")
+        elseif key == "jump" then H.release("jump")
+        elseif key == "aim" then H.stopAim()
+        elseif key == "bullet" then H.stopBulletAim()
+        elseif key == "afk" then
+            H.releaseIdle(false)
+            S.afkPulseUntil = nil
+        end
+        H.report("Toggle " .. key, message)
+    end
+    H.updateSwitches()
+    return ok
+end
+
+function H.cleanupCharacter()
+    H.disconnectAll(S.characterConnections)
+    -- A failure in one cleanup must not skip anchor/property restoration.
+    for _, cleanup in ipairs({H.stopAim, H.stopBulletAim, H.resetMovementHealth,
+        function() H.stopLock(false) end, H.stopMover, H.releaseFlingHold, H.releaseAll}) do
+        local ok, message = pcall(cleanup)
+        if not ok then H.report("Character cleanup", message) end
+    end
+    S.context, S.idleTarget, S.idleSince, S.idleSample = nil, nil, nil, nil
+    S.idleBlockedUntil = -math.huge
+    S.afkLastPulse, S.afkPulseUntil, S.afkPostPulseUntil = os.clock(), nil, -math.huge
+    S.safeRoot, S.previousHealth = nil, nil
+    S.safeTime, S.healing, S.lastDrop, S.lastJump = -math.huge, false, -math.huge, -math.huge
+    S.lastNPCLift = -math.huge
+    S.lastJumpRequest = -math.huge
+    S.lastDamageAt, S.lastSevereThreatAt = -math.huge, -math.huge
+    S.homeThreatAt, S.lastEmergency = -math.huge, -math.huge
+    S.damageEvents, S.impactEntries, S.recentHazard = {}, {}, nil
+    S.lastFlingRecovery = -math.huge
+    S.flingHoldTarget, S.flingSnapshot, S.flingLastStableCF = nil, nil, nil
+    S.flingLastStableAt, S.flingPauseUntil, S.flingInputUntil = -math.huge, -math.huge, -math.huge
+    S.flingRecovering = false
+    S.lockSuspended, S.escapeHold = false, nil
+    S.lastChaseRelocate, S.lastChaseThreatAt = -math.huge, -math.huge
+    S.escapeHistory, S.hazardCache = {}, nil
+    S.lastProtectionScanAt = -math.huge
+end
+
+function H.beginCharacter(character)
+    S.setupToken = S.setupToken + 1
+    local token = S.setupToken
+    H.cleanupCharacter()
+    task.spawn(function()
+        local root = character:WaitForChild("HumanoidRootPart", 10)
+        local humanoid = character:WaitForChild("Humanoid", 10)
+        if not S.alive or token ~= S.setupToken or player.Character ~= character then return end
+        if not root or not root:IsA("BasePart") or not humanoid or not humanoid:IsA("Humanoid") then
+            H.notice("Character requires a Humanoid and HumanoidRootPart", 6)
+            return
+        end
+        -- CharacterAdded may fire before Roblox parents the model to Workspace.
+        local deadline = os.clock() + 10
+        while not character:IsDescendantOf(Workspace) do
+            if not S.alive or token ~= S.setupToken or player.Character ~= character or os.clock() >= deadline then return end
+            task.wait(0.05)
+        end
+        local ctx = {character = character, root = root, humanoid = humanoid, parts = {}}
+        S.context = ctx
+        if not S.entrySpawn then
+            S.entrySpawn = root.CFrame
+            S.joinSpawn = H.findJoinSpawn()
+        end
+        for _, instance in ipairs(character:GetDescendants()) do
+            if instance:IsA("BasePart") then ctx.parts[instance] = true end
+        end
+        S.previousHealth = humanoid.Health
+        H.connect(character.DescendantAdded, function(instance)
+            if S.context == ctx and instance:IsA("BasePart") then ctx.parts[instance] = true end
+        end, S.characterConnections)
+        H.connect(character.DescendantRemoving, function(instance)
+            ctx.parts[instance] = nil
+            if instance == root or instance == humanoid then
+                if S.context == ctx then H.cleanupCharacter(); H.notice("Character components removed", 4) end
+            end
+        end, S.characterConnections)
+        -- Reference v6.1 used property listeners as well as state-disable calls.
+        -- Apply on each character (R6 or R15); cleaned on respawn.
+        H.connect(humanoid:GetPropertyChangedSignal("PlatformStand"), function()
+            if S.context == ctx and (S.flags.fling or S.flags.lock)
+                and not S.hovering and not S.flying and humanoid.PlatformStand then
+                H.recoverRagdoll()
+            end
+        end, S.characterConnections)
+        H.connect(humanoid:GetPropertyChangedSignal("Sit"), function()
+            if S.context == ctx and (S.flags.fling or S.flags.lock)
+                and not S.hovering and not S.flying and humanoid.Sit then
+                H.recoverRagdoll()
+            end
+        end, S.characterConnections)
+        H.connect(humanoid.StateChanged, function(_, newState)
+            if S.context ~= ctx or not (S.flags.fling or S.flags.lock) then return end
+            if newState == Enum.HumanoidStateType.Ragdoll
+                or newState == Enum.HumanoidStateType.FallingDown
+                or newState == Enum.HumanoidStateType.Physics
+                or newState == Enum.HumanoidStateType.PlatformStanding then
+                H.recoverRagdoll()
+            end
+        end, S.characterConnections)
+        H.recoverRagdoll()
+        H.connect(humanoid.HealthChanged, function(health)
+            if S.context ~= ctx then return end
+            local previous = S.previousHealth or health
+            S.previousHealth = health
+            if health <= 0 then
+                H.cleanupCharacter()
+                H.notice("Waiting for respawn", 5)
+                return
+            end
+            if health < previous and not S.healing then
+                local now = os.clock()
+                local loss = previous - health
+                -- The event fires as soon as Roblox reports the HP change; no
+                -- periodic scan or nearby-hazard match is required to respond.
+                S.lastDamageAt = now
+                for i = #S.damageEvents, 1, -1 do
+                    if now - S.damageEvents[i] > Config.DamageBurstWindow then
+                        table.remove(S.damageEvents, i)
+                    end
+                end
+                table.insert(S.damageEvents, now)
+                if S.flags.lock and H.ready() then
+                    local threshold = math.max(Config.EmergencyMinDamageThreshold,
+                        math.min(Config.EmergencyDamageAbsolute,
+                            humanoid.MaxHealth * Config.EmergencyDamageFraction))
+                    if loss + 1e-6 >= threshold
+                        or (loss >= 0.005 and #S.damageEvents >= Config.DamageBurstCount) then
+                        H.emergencyEscape(string.format("HP drop %.2f", loss))
+                    end
+                end
+            end
+        end, S.characterConnections)
+        H.connect(humanoid.Died, function()
+            if S.context == ctx then H.cleanupCharacter(); H.notice("Waiting for respawn", 5) end
+        end, S.characterConnections)
+        if S.flags.lock and H.ready() then H.applyLock() end
+        if S.flags.noclip and H.ready() then H.noclip("noclip", true) end
+        if S.flags.jump and H.ready() then H.applyCustomJump() end
+        if S.flags.aim and H.ready() then H.startAim() end
+        H.notice("Character ready", 2)
+    end)
+end
+
+function H.shutdown(destroyGui)
+    if not S.alive or S.shuttingDown then return end
+    S.shuttingDown = true
+    S.setupToken = S.setupToken + 1
+    -- A living airborne character gets the same safe landing attempt as Lock OFF.
+    if S.flags.lock then
+        local ok, message = pcall(H.stopLock, true)
+        if not ok then H.report("Shutdown landing", message) end
+    end
+    if S.hovering then
+        local ok, message = pcall(H.endHover, true)
+        if not ok then H.report("Shutdown skywalk landing", message) end
+    end
+    S.alive = false
+    H.disconnectAll(S.connections)
+    if S.cameraConnection then S.cameraConnection:Disconnect(); S.cameraConnection = nil end
+    H.cleanupCharacter()
+    for instance in pairs(S.watchers) do H.removeObject(instance) end
+    S.hazards, S.motion, S.npcs, S.pending, S.hazardErrors = {}, {}, {}, {}, {}
+    S.hazardCache = nil
+    if destroyGui and S.ui.gui then S.ui.gui:Destroy() end
+end
+
+-- A new v7 instance asks its predecessor to restore everything before removal.
+local previousGui = playerGui:FindFirstChild("DevPanelGui")
+if previousGui then
+    local shutdown = previousGui:FindFirstChild("GR33D_Shutdown")
+    if shutdown and shutdown:IsA("BindableEvent") then
+        shutdown:Fire()
+    else
+        warn("[GR33D] An older panel was found. Restart Play to remove its old loops/hooks.")
+    end
+    previousGui:Destroy()
+end
+
+-- Compact responsive panel. No deprecated Draggable property or manual canvas height.
+function H.make(className, properties, parent)
+    local instance = Instance.new(className)
+    for property, value in pairs(properties or {}) do instance[property] = value end
+    instance.Parent = parent
+    return instance
+end
+
+function H.corner(instance, radius)
+    H.make("UICorner", {CornerRadius = UDim.new(0, radius)}, instance)
+end
+
+function H.viewport()
+    local camera = Workspace.CurrentCamera
+    return camera and camera.ViewportSize or Vector2.new(800, 600)
+end
+
+function H.layout()
+    local viewport = H.viewport()
+    local width = math.min(270, math.max(170, viewport.X - 16))
+    local height = math.min(535, math.max(150, viewport.Y - 24))
+    local panel = S.ui.panel
+    local size = S.minimized and Vector2.new(52, 52) or Vector2.new(width, height)
+    panel.Size = UDim2.fromOffset(size.X, size.Y)
+    local position = panel.Position
+    panel.Position = UDim2.fromOffset(math.clamp(position.X.Offset, 4, math.max(4, viewport.X - size.X - 4)),
+        math.clamp(position.Y.Offset, 4, math.max(4, viewport.Y - size.Y - 4)))
+    S.ui.scroll.Visible, S.ui.status.Visible, S.ui.title.Visible = not S.minimized, not S.minimized, not S.minimized
+    S.ui.close.Visible = not S.minimized
+    S.ui.minimize.Size = S.minimized and UDim2.fromScale(1, 1) or UDim2.fromOffset(28, 28)
+    S.ui.minimize.Position = S.minimized and UDim2.fromOffset(0, 0) or UDim2.new(1, -66, 0, 7)
+    S.ui.minimize.Text = S.minimized and "+" or "-"
+end
+
+function H.row(label)
+    S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
+    local row = H.make("Frame", {Size = UDim2.new(1, 0, 0, 37), BackgroundTransparency = 1,
+        LayoutOrder = S.ui.nextOrder}, S.ui.scroll)
+    H.make("TextLabel", {Size = UDim2.new(1, -54, 1, 0), BackgroundTransparency = 1, Text = label,
+        TextColor3 = Color3.fromRGB(211, 216, 229), TextSize = 12, TextWrapped = true,
+        Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left}, row)
+    return row
+end
+
+function H.toggleRow(key, label)
+    local row = H.row(label)
+    local button = H.make("TextButton", {Name = key .. "Toggle", Size = UDim2.fromOffset(43, 23),
+        Position = UDim2.new(1, -43, 0.5, -11), Text = "", AutoButtonColor = false,
+        BackgroundColor3 = Color3.fromRGB(48, 50, 61)}, row)
+    H.corner(button, 12)
+    local knob = H.make("Frame", {Size = UDim2.fromOffset(14, 14), Position = UDim2.new(0, 4, 0.5, -7),
+        BackgroundColor3 = Color3.fromRGB(240, 243, 250)}, button)
+    H.corner(knob, 8)
+    S.switches[key] = {button = button, knob = knob}
+    H.connect(button.Activated, function() H.setToggle(key, not S.flags[key]) end)
+end
+
+function H.numericRow(label, key, minimum, maximum, onChange)
+    local row = H.row(label)
+    local input = H.make("TextBox", {Name = key .. "Input", Size = UDim2.fromOffset(58, 27),
+        Position = UDim2.new(1, -58, 0.5, -13), Text = tostring(S[key]), ClearTextOnFocus = false,
+        TextColor3 = Color3.fromRGB(240, 243, 250), BackgroundColor3 = Color3.fromRGB(37, 43, 57),
+        TextSize = 12, Font = Enum.Font.GothamBold}, row)
+    H.corner(input, 6)
+    H.connect(input.FocusLost, function()
+        local number = tonumber(input.Text)
+        if H.finite(number) then
+            S[key] = math.clamp(number, minimum, maximum)
+            if onChange then onChange() end
+        else H.notice("Enter a finite number for " .. label, 3) end
+        input.Text = tostring(S[key])
+    end)
+    return input
+end
+
+function H.button(label, callback, color)
+    S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
+    local button = H.make("TextButton", {Size = UDim2.new(1, 0, 0, 33), Text = label, LayoutOrder = S.ui.nextOrder,
+        TextColor3 = Color3.fromRGB(240, 243, 250), TextSize = 12, Font = Enum.Font.GothamBold,
+        BackgroundColor3 = color or Color3.fromRGB(44, 95, 143)}, S.ui.scroll)
+    H.corner(button, 7)
+    H.connect(button.Activated, function()
+        local ok, message = pcall(callback)
+        if not ok then H.report(label, message) end
+    end)
+    return button
+end
+
+S.ui.gui = H.make("ScreenGui", {Name = "DevPanelGui", ResetOnSpawn = false, IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1000}, playerGui)
+S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true, BackgroundColor3 = Color3.fromRGB(19, 22, 30),
+    BorderSizePixel = 0, Position = UDim2.fromOffset(math.max(4, H.viewport().X - 282), 20)}, S.ui.gui)
+H.corner(S.ui.panel, 12)
+H.make("UIStroke", {Thickness = 1, Color = Color3.fromRGB(61, 72, 95)}, S.ui.panel)
+S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -82, 0, 43), Position = UDim2.fromOffset(12, 0),
+    BackgroundTransparency = 1, Text = "GR33D  v7.11", TextColor3 = Color3.fromRGB(234, 240, 250),
+    TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
+S.ui.minimize = H.make("TextButton", {Text = "-", BackgroundColor3 = Color3.fromRGB(37, 43, 57),
+    TextColor3 = Color3.fromRGB(234, 240, 250), TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
+H.corner(S.ui.minimize, 8)
+S.ui.close = H.make("TextButton", {Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, -33, 0, 7),
+    Text = "x", BackgroundColor3 = Color3.fromRGB(98, 45, 55), TextColor3 = Color3.fromRGB(255, 239, 239),
+    TextSize = 15, Font = Enum.Font.GothamBold}, S.ui.panel)
+H.corner(S.ui.close, 8)
+S.ui.scroll = H.make("ScrollingFrame", {Size = UDim2.new(1, -22, 1, -91), Position = UDim2.fromOffset(11, 45),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.fromOffset(0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarImageColor3 = Color3.fromRGB(95, 117, 151)}, S.ui.panel)
+H.make("UIPadding", {PaddingRight = UDim.new(0, 7), PaddingBottom = UDim.new(0, 8)}, S.ui.scroll)
+H.make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, S.ui.scroll)
+S.ui.status = H.make("TextLabel", {Size = UDim2.new(1, -24, 0, 35), Position = UDim2.new(0, 12, 1, -40),
+    BackgroundTransparency = 1, Text = "Client protection tools", TextColor3 = Color3.fromRGB(133, 157, 190),
+    TextSize = 10, TextWrapped = true, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
+
+H.toggleRow("lock", "Anti Exploiter / Position Lock")
+H.toggleRow("fling", "Anti-Fling / Ragdoll Recovery")
+H.toggleRow("monster", "Anti-Monster / Hostile AI Skywalk")
+H.toggleRow("trap", "Anti Trap (seat / stun recovery)")
+H.toggleRow("fall", "Fall Speed Limit")
+H.toggleRow("health", "Health Regeneration (local)")
+H.toggleRow("noclip", "Noclip")
+H.toggleRow("flight", "Flight (double-tap jump)")
+H.toggleRow("run", "Run Speed Override")
+
+H.numericRow("Run Speed (5-200)", "runSpeed", Config.MinRunSpeed, Config.MaxRunSpeed, H.resetRunObservation)
+H.toggleRow("jump", "Custom Jump")
+H.numericRow("Jump Power (0-200)", "jumpPower", Config.MinJumpPower, Config.MaxJumpPower, function()
+    if S.flags.jump then H.applyCustomJump() end
+end)
+H.toggleRow("aim", "Auto Aim (hostile enemies)")
+H.toggleRow("bullet", "Bullet Aim (compatible guns)")
+S.bulletRange = Config.BulletRange
+H.numericRow("Bullet Range (100-5000)", "bulletRange", 100, 5000, function()
+    Config.BulletRange = S.bulletRange
+end)
+H.toggleRow("afk", "AFK Streak")
+
+H.button("TP to Entry Spawn", function()
+    if not H.ready() then H.notice("Wait for a living character", 3); return end
+    local spawn = H.findJoinSpawn()
+    -- A verified spawn pad takes priority. An initial recorded CFrame is used
+    -- only if the map has no eligible SpawnLocation at all.
+    local target = spawn and H.spawnRootTarget(spawn) or S.entrySpawn
+    if target then H.teleport(target, "entry spawn")
+    else H.notice("Join spawn unknown; run the panel at join or use a SpawnLocation", 5) end
+end)
+H.button("Save Current Map Location", function()
+    if not H.ready() then H.notice("Wait for a living character", 3); return end
+    S.savedLocation = S.context.root.CFrame
+    player:SetAttribute("GR33D_SavedLocation", S.savedLocation)
+    H.notice("Saved location at your current position", 3)
+end, Color3.fromRGB(106, 65, 147))
+H.button("TP to Saved Map Location", function()
+    local destination = S.savedLocation or player:GetAttribute("GR33D_SavedLocation")
+    if typeof(destination) == "CFrame" then
+        S.savedLocation = destination
+        H.teleport(destination, "saved map location")
+    else H.notice("Save a map location first", 3) end
+end, Color3.fromRGB(43, 121, 91))
+
+H.button("Disable All / Restore Character", function()
+    for _, key in ipairs({"lock", "monster", "flight", "noclip", "fling", "trap", "run", "jump", "aim", "bullet", "afk", "health", "fall"}) do
+        H.setToggle(key, false)
+    end
+    H.releaseAll()
+    H.notice("All panel features disabled", 3)
+end, Color3.fromRGB(113, 64, 62))
+
+local shutdownEvent = H.make("BindableEvent", {Name = "GR33D_Shutdown"}, S.ui.gui)
+S.weaponHooks.query = H.make("BindableFunction", {Name = "GR33D_GetShotAim"}, S.ui.gui)
+S.weaponHooks.query.OnInvoke = H.getShotAim
+S.weaponHooks.register = H.make("BindableFunction", {Name = "GR33D_RegisterBullet"}, S.ui.gui)
+S.weaponHooks.register.OnInvoke = H.registerBullet
+S.weaponHooks.cast = H.make("BindableFunction", {Name = "GR33D_CastShot"}, S.ui.gui)
+S.weaponHooks.cast.OnInvoke = H.castGuidedShot
+S.weaponHooks.shot = H.make("BindableFunction", {Name = "GR33D_RegisterShot"}, S.ui.gui)
+S.weaponHooks.shot.OnInvoke = H.registerShot
+S.weaponHooks.hit = H.make("BindableEvent", {Name = "GR33D_GuidedHit"}, S.ui.gui)
+H.connect(shutdownEvent.Event, function() H.shutdown(true) end)
+H.connect(S.ui.gui.Destroying, function() H.shutdown(false) end)
+if typeof(script) == "Instance" then H.connect(script.Destroying, function() H.shutdown(true) end) end
+H.connect(S.ui.close.Activated, function() H.shutdown(true) end)
+H.connect(S.ui.minimize.Activated, function()
+    -- A dragged minimized icon must not also expand on release.
+    if (S.dragging and S.dragging.moved) or os.clock() < S.suppressMinimizeUntil then return end
+    S.minimized = not S.minimized
+    H.layout()
+end)
+
+function H.beginDrag(input)
+    if S.dragging then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        S.dragging = {input = input, start = input.Position, position = S.ui.panel.Position, moved = false}
+    end
+end
+H.connect(S.ui.title.InputBegan, H.beginDrag)
+H.connect(S.ui.minimize.InputBegan, function(input) if S.minimized then H.beginDrag(input) end end)
+H.connect(UserInputService.InputChanged, function(input)
+    local drag = S.dragging
+    if not drag then return end
+    local matching = input == drag.input or (drag.input.UserInputType == Enum.UserInputType.MouseButton1
+        and input.UserInputType == Enum.UserInputType.MouseMovement)
+    if not matching then return end
+    local delta = input.Position - drag.start
+    if delta.Magnitude > 4 then drag.moved = true end
+    S.ui.panel.Position = UDim2.fromOffset(drag.position.X.Offset + delta.X, drag.position.Y.Offset + delta.Y)
+    H.layout()
+end)
+H.connect(UserInputService.InputEnded, function(input)
+    if S.dragging and input == S.dragging.input then
+        local ended = S.dragging
+        if ended.moved then S.suppressMinimizeUntil = os.clock() + 0.2 end
+        -- Activated can fire after InputEnded; retain the drag flag through that event.
+        task.defer(function() if S.dragging == ended then S.dragging = nil end end)
+    end
+end)
+
+function H.bindCamera()
+    if S.cameraConnection then S.cameraConnection:Disconnect(); S.cameraConnection = nil end
+    local camera = Workspace.CurrentCamera
+    if camera then S.cameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(H.layout) end
+    H.layout()
+end
+H.connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), H.bindCamera)
+H.bindCamera()
+
+task.spawn(function()
+    local scripts = player:WaitForChild("PlayerScripts", 5)
+    local module = scripts and scripts:WaitForChild("PlayerModule", 5)
+    if not module or not S.alive then return end
+    local ok, result = pcall(function() return require(module):GetControls() end)
+    if ok then S.controls = result end
+end)
+
+H.connect(UserInputService.InputBegan, function(input, gameProcessed)
+    if gameProcessed or not S.flags.fling or UserInputService:GetFocusedTextBox() then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    local key = input.KeyCode
+    if key == Enum.KeyCode.W or key == Enum.KeyCode.A or key == Enum.KeyCode.S
+        or key == Enum.KeyCode.D or key == Enum.KeyCode.Up or key == Enum.KeyCode.Down
+        or key == Enum.KeyCode.Left or key == Enum.KeyCode.Right
+        or key == Enum.KeyCode.Space then
+        S.flingInputUntil = os.clock() + Config.FlingInputReleaseGrace
+        H.releaseFlingHold(Config.FlingInputReleaseGrace)
+    end
+end)
+
+H.connect(UserInputService.InputBegan, function(input, gameProcessed)
+    if gameProcessed or not S.flags.afk or UserInputService:GetFocusedTextBox() then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    local key = input.KeyCode
+    if key == Enum.KeyCode.W or key == Enum.KeyCode.A or key == Enum.KeyCode.S
+        or key == Enum.KeyCode.D or key == Enum.KeyCode.Up or key == Enum.KeyCode.Down
+        or key == Enum.KeyCode.Left or key == Enum.KeyCode.Right
+        or key == Enum.KeyCode.Space then
+        if S.afkPulseUntil and H.ready() then
+            S.context.humanoid:Move(Vector3.zero, false)
+        end
+        H.releaseIdle(true)
+        S.afkLastPulse, S.afkPulseUntil = os.clock(), nil
+        S.afkPostPulseUntil = -math.huge
+    end
+end)
+
+H.connect(UserInputService.JumpRequest, function()
+    -- A jump always releases the idle lease, even when flight is not armed.
+    H.releaseIdle(true)
+    if S.flags.fling then
+        S.flingInputUntil = os.clock() + Config.FlingInputReleaseGrace
+        H.releaseFlingHold(Config.FlingInputReleaseGrace)
+    end
+    H.noteCustomJump()
+    if not S.flags.flight or not H.ready() or S.flags.lock or UserInputService:GetFocusedTextBox() then return end
+    local now = os.clock()
+    if now - S.lastJumpRequest < 0.12 then return end
+    S.lastJumpRequest = now
+    if now - S.lastJump <= Config.DoubleTapWindow then
+        if S.flying then H.stopMover()
+        else
+            local state = S.context.humanoid:GetState()
+            if state == Enum.HumanoidStateType.Jumping or state == Enum.HumanoidStateType.Freefall
+                or S.context.humanoid.FloorMaterial == Enum.Material.Air then H.startMover("flight") end
+        end
+        S.lastJump = -math.huge
+    else S.lastJump = now end
+end)
+
+H.connect(Workspace.DescendantAdded, function(instance)
+    if S.alive then
+        table.insert(S.pending, instance)
+        if S.flags.lock or S.flags.monster or S.flags.aim or S.flags.bullet then
+            -- An active protection switch must see new threats immediately.
+            local ok, message = pcall(H.watchObject, instance)
+            if not ok then H.report("New object index", message) end
+        end
+    end
+end)
+H.connect(Workspace.DescendantRemoving, H.removeObject)
+for _, tags in ipairs({Config.HazardTags, Config.HostileTags, Config.FriendlyTags, {"ProtectionIgnore"}}) do
+    for _, tag in ipairs(tags) do
+        H.connect(CollectionService:GetInstanceAddedSignal(tag), function(instance)
+            if instance:IsDescendantOf(Workspace) then H.watchObject(instance); H.refreshObject(instance); H.queueBranch(instance) end
+        end)
+        H.connect(CollectionService:GetInstanceRemovedSignal(tag), function(instance) H.refreshObject(instance); H.queueBranch(instance) end)
+    end
+end
+for _, instance in ipairs(Workspace:GetDescendants()) do table.insert(S.pending, instance) end
+
+H.connect(player.CharacterAdded, H.beginCharacter)
+H.connect(player.CharacterRemoving, function(character)
+    if S.context and S.context.character == character then
+        S.setupToken = S.setupToken + 1
+        H.cleanupCharacter()
+    end
+end)
+if player.Character then H.beginCharacter(player.Character) end
+
+function H.physicsTick(deltaTime)
+    if not H.ready() then return end
+    local ctx = S.context
+    H.observeRunCorrection(deltaTime)
+    H.applyCustomJump()
+    H.applyCollision()
+    H.updateFling("pre")
+    H.updateAFK()
+    H.updateGuidedBullets(deltaTime)
+    if S.flags.lock then
+        H.updateEscape()
+        if S.escape then H.updateEscapeHold() else H.applyLock() end
+        return
+    end
+    if S.mover then H.updateMover(); return end
+    if ctx.root.Anchored then return end
+    if S.flags.trap then
+        if ctx.humanoid.Sit then ctx.humanoid.Sit = false end
+        if ctx.humanoid.PlatformStand then ctx.humanoid.PlatformStand = false end
+        local state = ctx.humanoid:GetState()
+        if state == Enum.HumanoidStateType.Ragdoll or state == Enum.HumanoidStateType.FallingDown
+            or state == Enum.HumanoidStateType.PlatformStanding then
+            ctx.humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+    end
+    H.updateRun(deltaTime)
+    if S.flags.fall and ctx.humanoid.FloorMaterial == Enum.Material.Air then
+        local velocity = ctx.root.AssemblyLinearVelocity
+        if velocity.Y < -Config.FallSpeedLimit then
+            ctx.root.AssemblyLinearVelocity = Vector3.new(velocity.X, -Config.FallSpeedLimit, velocity.Z)
+        end
+    end
+    H.authorizePhysicsVelocity()
+end
+
+H.connect(RunService.PreSimulation, function(dt)
+    local ok, message = pcall(H.physicsTick, dt)
+    if not ok then
+        -- A broken physics callback must not repeatedly leave the rig anchored.
+        for key in pairs(S.flags) do S.flags[key] = false end
+        for _, cleanup in ipairs({function() H.stopLock(false) end, H.stopMover,
+            H.stopAim, H.stopBulletAim, H.releaseAll, H.updateSwitches}) do
+            pcall(cleanup)
+        end
+        H.report("Physics update; features disabled", message)
+    end
+end)
+
+H.connect(RunService.PostSimulation, function(dt)
+    if S.flags.fling and H.ready() then
+        local ok, message = pcall(H.updateFling, "post", dt)
+        if not ok then H.report("Post-physics anti-fling", message) end
+    end
+    local ok, message = pcall(H.recordRunPosition)
+    if not ok then H.report("Run movement observation", message) end
+end)
+
+H.connect(RunService.Heartbeat, function(deltaTime)
+    if not S.alive then return end
+    local healthOK, healthMessage = pcall(H.updateHealthRecovery, deltaTime)
+    if not healthOK then
+        S.flags.health = false
+        H.updateSwitches()
+        H.report("Health regeneration", healthMessage)
+    end
+    -- Initial indexing is spread across frames instead of blocking on a large map.
+    local processed = 0
+    while S.pendingIndex <= #S.pending and processed < Config.IndexBatchSize do
+        local instance = S.pending[S.pendingIndex]
+        S.pendingIndex, processed = S.pendingIndex + 1, processed + 1
+        local ok, message = pcall(H.watchObject, instance)
+        if not ok then H.report("Background object index", message) end
+    end
+    if S.pendingIndex > #S.pending then S.pending, S.pendingIndex = {}, 1 end
+    S.scanClock = S.scanClock + deltaTime
+    if S.scanClock < Config.ScanInterval then return end
+    S.scanClock = 0
+    if H.ready() then
+        local ok, message = pcall(function()
+            H.updateEscape()
+            H.updateNPCs()
+            local ctx = S.context
+            local velocity = ctx.root.AssemblyLinearVelocity
+            if not S.flags.lock and not S.mover and not ctx.root.Anchored
+                and ctx.humanoid.FloorMaterial ~= Enum.Material.Air and not ctx.humanoid.Sit
+                and H.finiteVector(velocity) and velocity.Magnitude < Config.FlingLinearThreshold * 0.5
+                and ctx.root.Position.Y > Workspace.FallenPartsDestroyHeight + 10 then
+                S.safeRoot, S.safeTime = ctx.root.CFrame, os.clock()
+            end
+        end)
+        if not ok then H.report("Protection scan", message) end
+    end
+    if S.ui.status and S.ui.status.Parent then
+        if os.clock() < S.noticeUntil then S.ui.status.Text = S.notice
+        elseif not H.ready() then S.ui.status.Text = "Waiting for a living character"
+        elseif S.pendingIndex <= #S.pending then S.ui.status.Text = "Indexing hazards and NPCs..."
+        elseif S.escape and S.escape.mode == "emergency" then
+            S.ui.status.Text = "Emergency evasion: lock released; tracking pursuit"
+        elseif S.escape and S.escape.mode == "manual" then
+            S.ui.status.Text = "Teleporting: lock temporarily released"
+        elseif S.escape then S.ui.status.Text = "Dodging: lock released; waiting for safety"
+        elseif S.flags.lock then S.ui.status.Text = "Position locked - client protection"
+        elseif S.flying then S.ui.status.Text = "Flying - double-tap jump to stop"
+        elseif S.hovering then S.ui.status.Text = "Anti-Monster: skywalk active - use movement controls"
+        elseif S.flags.aim then S.ui.status.Text = S.aimTarget and ("Auto Aim: " .. S.aimTarget.Name) or "Auto Aim: scanning visible hostile enemies"
+        elseif S.flags.bullet then
+            local count = 0
+            for _ in pairs(S.guidedBullets) do count = count + 1 end
+            S.ui.status.Text = count > 0 and ("Bullet Aim: guiding " .. tostring(count) .. " projectiles") or "Bullet Aim: awaiting compatible gun shots"
+        elseif S.flags.monster then S.ui.status.Text = "Anti-Monster armed: scanning hostile AI and worms"
+        elseif S.runBackoffUntil and os.clock() < S.runBackoffUntil then S.ui.status.Text = "Run override paused after repeated position corrections"
+        elseif S.flags.health then S.ui.status.Text = S.healthStatus or "Health regeneration enabled (local)"
+        elseif S.flags.afk and S.afkPulseUntil then S.ui.status.Text = "AFK Streak: activity pulse"
+        elseif S.flags.afk and S.idleTarget then S.ui.status.Text = "AFK Streak: holding idle position"
+        elseif S.flags.afk then S.ui.status.Text = "AFK Streak: waiting for stable ground"
+        else S.ui.status.Text = "Client protection tools ready" end
+    end
+end)
+
+H.updateSwitches()
+print("[GR33D v7.11] Swept hazard prediction, persistent chase evasion, hostile AI skywalk, custom movement, and compatible weapon modes loaded.")
