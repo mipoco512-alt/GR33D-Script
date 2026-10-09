@@ -1,4 +1,4 @@
--- GR33D Panel v7.16: faster verified skywalk descent + hostile-only camera aim
+-- GR33D Panel v7.18: faster verified skywalk descent + hostile-only camera aim
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -94,15 +94,15 @@ local Config = {
     MaxRunSpeed = 200,
     DoubleTapWindow = 0.35,
     NPCStartDistance = 15,
-    NPCStopDistance = 18, -- slight hysteresis prevents rapid lift/drop oscillation
+    NPCStopDistance = 16, -- landing clears at 16 studs; 15-stud lift trigger unchanged
     NPCLiftHeight = 15,
     NPCClearanceHeight = 3,
-    NPCLiftCooldown = 0.35,
+    NPCLiftCooldown = 0.16, -- react quickly to a nearby rising monster during skywalk
     NPCMinHoverDuration = 0.20, -- leave skywalk sooner once landing is safe
     NPCQuietTime = 0.12, -- shorten safe-clear delay; retain safe landing checks
-    NPCScanRadius = 42,
-    NPCScanInterval = 0.08, -- slightly faster proximity updates only while enabled
-    NPCMaxLocalParts = 200,
+    NPCScanRadius = 27, -- full search used only while hovering
+    NPCScanInterval = 0.02, -- check at the next physics frame when a monster enters 15 studs
+    NPCMaxLocalParts = 200, -- prevent expensive wide-radius hover queries
     NPCLandingDepth = 750,
     AimRange = 600,
     AimRadiusPixels = 320,
@@ -2089,10 +2089,14 @@ function H.npcProximity(position)
         S.npcOverlap = overlap
     end
     overlap.FilterDescendantsInstances = {S.context.character}
+    -- A narrow, uncapped query avoids missing a monster behind hundreds of map parts.
+    -- This changes scan cost, NOT the 15-stud activation distance.
+    local radius = S.hovering and Config.NPCScanRadius or (Config.NPCStartDistance + 2)
+    overlap.MaxParts = S.hovering and Config.NPCMaxLocalParts or 0
     -- During a 15-stud hover, include nearby ground-level worm segments.
     local center = position
     if S.hovering then center = position - Vector3.new(0, Config.NPCLiftHeight * 0.5, 0) end
-    local parts = Workspace:GetPartBoundsInRadius(center, Config.NPCScanRadius, overlap)
+    local parts = Workspace:GetPartBoundsInRadius(center, radius, overlap)
     local nearest3D, nearestXZ, highestTop = math.huge, math.huge, -math.huge
     local excluded, seen, classified, excludedOwner = {}, {}, {}, {}
     for _, part in ipairs(parts) do
@@ -2207,8 +2211,8 @@ function H.updateNPCs()
     else
         -- Immediately try a verified landing once the monster leaves the
         -- horizontal danger radius. Avoid a second hold/quiet countdown.
-        -- Retry at most every 0.12s if local ground is temporarily blocked.
-        if now - (S.npcLastLandingAttempt or -math.huge) >= 0.12 then
+        -- Retry promptly if ground was temporarily blocked, without busy-looping raycasts.
+        if now - (S.npcLastLandingAttempt or -math.huge) >= 0.06 then
             S.npcLastLandingAttempt = now
             if not H.endHover(true, true)
                 and now - (S.npcLastLandingNotice or -math.huge) >= 2 then
@@ -3813,7 +3817,7 @@ S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true, BackgroundColor
 H.corner(S.ui.panel, 12)
 H.make("UIStroke", {Thickness = 1, Color = Color3.fromRGB(61, 72, 95)}, S.ui.panel)
 S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -82, 0, 43), Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1, Text = "GR33D  v7.17", TextColor3 = Color3.fromRGB(234, 240, 250),
+    BackgroundTransparency = 1, Text = "GR33D  v7.18", TextColor3 = Color3.fromRGB(234, 240, 250),
     TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
 S.ui.minimize = H.make("TextButton", {Text = "-", BackgroundColor3 = Color3.fromRGB(37, 43, 57),
     TextColor3 = Color3.fromRGB(234, 240, 250), TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
@@ -4066,6 +4070,12 @@ function H.physicsTick(deltaTime)
 end
 
 H.connect(RunService.PreSimulation, function(dt)
+    -- Anti-Monster gets an independent, fast physics-frame check; the rest of
+    -- the panel keeps its existing scan cadence. Zero work when the toggle is off.
+    if S.flags.monster and not S.flags.lock and not S.flying and H.ready() then
+        local npcOK, npcMessage = pcall(H.updateNPCs)
+        if not npcOK then H.report("Fast anti-monster check", npcMessage) end
+    end
     local ok, message = pcall(H.physicsTick, dt)
     if not ok then
         -- A broken physics callback must not repeatedly leave the rig anchored.
@@ -4115,7 +4125,7 @@ H.connect(RunService.Heartbeat, function(deltaTime)
     if H.ready() then
         local ok, message = pcall(function()
             H.updateEscape()
-            H.updateNPCs()
+            -- Anti-Monster is checked in PreSimulation instead of this slower loop.
             local ctx = S.context
             local velocity = ctx.root.AssemblyLinearVelocity
             if not S.flags.lock and not S.mover and not ctx.root.Anchored
@@ -4156,4 +4166,4 @@ H.connect(RunService.Heartbeat, function(deltaTime)
 end)
 
 H.updateSwitches()
-print("[GR33D v7.17] Local lock scanning, enemy-only PvP aim and steadier AFK hold/pulse loaded.")
+print("[GR33D v7.18] Local lock scanning, enemy-only PvP aim and steadier AFK hold/pulse loaded.")
