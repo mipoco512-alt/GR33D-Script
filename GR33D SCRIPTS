@@ -1,4 +1,4 @@
--- GR33D Panel v7.11: swept hazard prediction, persistent chase evasion, runtime recovery
+-- GR33D Panel v7.12: on-demand indexing + 15-stud local anti-monster skywalk
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -88,14 +88,17 @@ local Config = {
     MinRunSpeed = 5,
     MaxRunSpeed = 200,
     DoubleTapWindow = 0.35,
-    NPCStartDistance = 45,
-    NPCStopDistance = 65,
-    NPCLiftHeight = 100,
-    NPCClearanceHeight = 35,
-    NPCLiftCooldown = 0.25,
-    NPCMinHoverDuration = 1.5,
-    NPCQuietTime = 1.0,
-    NPCLandingDepth = 1200,
+    NPCStartDistance = 15,
+    NPCStopDistance = 18, -- slight hysteresis prevents rapid lift/drop oscillation
+    NPCLiftHeight = 15,
+    NPCClearanceHeight = 3,
+    NPCLiftCooldown = 0.35,
+    NPCMinHoverDuration = 0.45,
+    NPCQuietTime = 0.35,
+    NPCScanRadius = 42,
+    NPCScanInterval = 0.12,
+    NPCMaxLocalParts = 200,
+    NPCLandingDepth = 750,
     AimRange = 600,
     AimRadiusPixels = 320,
     AimResponse = 18,
@@ -142,6 +145,7 @@ local S = {
     afkLastPulse = os.clock(), afkPulseUntil = nil, afkPostPulseUntil = -math.huge,
     safeRoot = nil, safeTime = -math.huge, hoverY = nil,
     hoverStartedAt = nil, hoverQuietSince = nil, lastNPCLift = -math.huge,
+    npcNearbyIgnore = {}, npcLastScanAt = -math.huge, npcOverlap = nil,
     aimTarget = nil, aimBound = false, lastAimScan = -math.huge,
     aimBinding = "GR33D_Aim_" .. tostring(player.UserId),
     guidedBullets = {}, weaponHooks = {},
@@ -953,53 +957,87 @@ function H.npcCandidate(instance)
     return false
 end
 
+function H.worldIndexNeeded()
+    return S.flags.lock or S.flags.aim or S.flags.bullet
+end
+
+function H.enemyIndexNeeded()
+    return S.flags.aim or S.flags.bullet
+end
+
 function H.refreshObject(instance)
-    if not S.alive or not instance.Parent then return end
+    if not S.alive or not instance or not instance.Parent or not H.worldIndexNeeded() then return end
+    local wantHazard = S.flags.lock
+    local wantEnemy = H.enemyIndexNeeded()
     local wasHazard = S.hazards[instance]
-    S.hazards[instance] = H.hazardCandidate(instance) or nil
+    S.hazards[instance] = wantHazard and H.hazardCandidate(instance) or nil
     if wasHazard or S.hazards[instance] then S.hazardCache = nil end
-    S.npcs[instance] = H.npcCandidate(instance) or nil
+    S.npcs[instance] = wantEnemy and H.npcCandidate(instance) or nil
     if S.flags.bullet and instance:IsA("BasePart") then H.tryRegisterBullet(instance) end
-    -- A model can be inserted before its parts or humanoid exist.
     local ancestor = instance.Parent
     while ancestor and ancestor ~= Workspace do
         if ancestor:IsA("Model") or ancestor:IsA("Folder") then
-            local ancestorHazard = S.hazards[ancestor]
-            S.hazards[ancestor] = H.hazardCandidate(ancestor) or nil
-            if ancestorHazard or S.hazards[ancestor] then S.hazardCache = nil end
-            S.npcs[ancestor] = H.npcCandidate(ancestor) or nil
+            local old = S.hazards[ancestor]
+            S.hazards[ancestor] = wantHazard and H.hazardCandidate(ancestor) or nil
+            if old or S.hazards[ancestor] then S.hazardCache = nil end
+            S.npcs[ancestor] = wantEnemy and H.npcCandidate(ancestor) or nil
         end
-        if S.flags.bullet and ancestor:IsA("BasePart") then H.tryRegisterBullet(ancestor) end
         ancestor = ancestor.Parent
     end
 end
 
 function H.watchObject(instance)
-    if not S.alive or not instance:IsDescendantOf(Workspace) then return end
-    if H.watchEnemyMetadata(instance) then return end
-    if instance:IsA("Humanoid") or instance:IsA("AnimationController") then H.refreshObject(instance); return end
-    if not (instance:IsA("BasePart") or instance:IsA("Model") or instance:IsA("Explosion") or instance:IsA("Folder")) then return end
+    if not S.alive or not H.worldIndexNeeded() or not instance
+        or not instance:IsDescendantOf(Workspace) then return end
+    if H.enemyIndexNeeded() and H.watchEnemyMetadata(instance) then return end
+    if instance:IsA("Humanoid") or instance:IsA("AnimationController") then
+        if H.enemyIndexNeeded() then H.refreshObject(instance) end
+        return
+    end
+    if not (instance:IsA("BasePart") or instance:IsA("Model")
+        or instance:IsA("Explosion") or instance:IsA("Folder")) then return end
+    -- Do not attach listeners to every door, tree and decoration.
+    local relevantHazard = S.flags.lock and H.hazardCandidate(instance)
+    local relevantEnemy = H.enemyIndexNeeded() and H.npcCandidate(instance)
+    if S.flags.bullet and instance:IsA("BasePart") then H.tryRegisterBullet(instance) end
+    if not (relevantHazard or relevantEnemy or S.watchers[instance]) then return end
     if S.watchers[instance] then H.refreshObject(instance); return end
     local connections = {}
     S.watchers[instance] = connections
     H.connect(instance:GetPropertyChangedSignal("Name"), function()
+        if not H.worldIndexNeeded() then return end
         H.refreshObject(instance)
         H.queueBranch(instance)
     end, connections)
     H.connect(instance.AttributeChanged, function(attribute)
+        if not H.worldIndexNeeded() then return end
         H.refreshObject(instance)
-        if attribute == "ProtectionIgnore" or attribute == "Active" or attribute == "IsActive" or attribute == "Armed"
-            or attribute == "OwnerUserId" or attribute == "ShooterUserId" or attribute == "CreatorUserId" then
-            H.queueBranch(instance)
-        end
+        if attribute == "ProtectionIgnore" or attribute == "Active"
+            or attribute == "IsActive" or attribute == "Armed"
+            or attribute == "OwnerUserId" or attribute == "ShooterUserId"
+            or attribute == "CreatorUserId" then H.queueBranch(instance) end
     end, connections)
     H.refreshObject(instance)
 end
 
 function H.queueBranch(instance)
-    if not S.alive or not instance:IsDescendantOf(Workspace) then return end
-    -- Refresh existing watches as well as newly discovered children.
-    for _, child in ipairs(instance:GetDescendants()) do table.insert(S.pending, child) end
+    if not H.worldIndexNeeded() or not S.alive or not instance
+        or not instance:IsDescendantOf(Workspace) then return end
+    -- Only queue relevant descendants; no unbounded background work while OFF.
+    for _, child in ipairs(instance:GetDescendants()) do
+        if (S.flags.lock and H.hazardCandidate(child))
+            or (H.enemyIndexNeeded() and H.npcCandidate(child)) then
+            table.insert(S.pending, child)
+        end
+    end
+end
+
+function H.clearInactiveIndexes()
+    if H.worldIndexNeeded() then return end
+    S.pending, S.pendingIndex = {}, 1
+    for instance in pairs(S.watchers) do H.removeObject(instance) end
+    S.npcs, S.hazards, S.motion, S.hazardErrors, S.impactEntries = {}, {}, {}, {}, {}
+    S.hazardCache, S.hazardCacheAt = nil, -math.huge
 end
 
 function H.removeObject(instance)
@@ -1737,6 +1775,7 @@ function H.stopMover()
     local wasHovering = S.hovering
     if S.mover then
         S.mover.velocity:Destroy()
+        if S.mover.heightHold then S.mover.heightHold:Destroy() end
         if S.mover.orientation then S.mover.orientation:Destroy() end
         S.mover.attachment:Destroy()
         S.mover = nil
@@ -1771,7 +1810,16 @@ function H.startMover(kind, target)
     velocity.Name = "GR33D_MovementVelocity"
     velocity.Attachment0 = attachment
     velocity.RelativeTo = Enum.ActuatorRelativeTo.World
-    velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+    if kind == "hover" then
+        -- Plane motor owns only X/Z; dedicated height controller owns Y.
+        -- Avoids competing vertical forces and bobbing while skywalking.
+        velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+        velocity.PrimaryTangentAxis = Vector3.xAxis
+        velocity.SecondaryTangentAxis = Vector3.zAxis
+        velocity.PlaneVelocity = Vector2.zero
+    else
+        velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+    end
     velocity.ForceLimitsEnabled = true
     velocity.ForceLimitMode = Enum.ForceLimitMode.Magnitude
     velocity.MaxForce = kind == "flight" and Config.FlightMaxForce
@@ -1799,6 +1847,14 @@ function H.startMover(kind, target)
         orientation.CFrame = CFrame.lookAt(Vector3.zero, facing)
         orientation.Parent = ctx.root
         S.mover.orientation = orientation
+        local heightHold = Instance.new("BodyPosition")
+        heightHold.Name = "GR33D_SkywalkHeightHold"
+        heightHold.MaxForce = Vector3.new(0, math.max(50000,
+            ctx.root.AssemblyMass * Workspace.Gravity * 6), 0)
+        heightHold.P, heightHold.D = 10000, 1100
+        heightHold.Position = target.Position
+        heightHold.Parent = ctx.root
+        S.mover.heightHold = heightHold
         S.hoverY, S.hoverStartedAt = target.Position.Y, os.clock()
         if not H.moveRoot(target) then H.stopMover(); return false end
         H.zeroRigVelocity()
@@ -1844,6 +1900,9 @@ function H.hostileNPC(instance)
     while current and current ~= Workspace do
         if current:IsA("Model") and not nearestModel then nearestModel = current end
         if H.enemyExplicitHostile(current) then return true end
+        -- The worm reference marks some monsters with AIState even while idling.
+        if current:IsA("Model") and current:GetAttribute("AIState") ~= nil
+            and not H.enemyFriendly(current) then return true end
         -- An owning rig's optional name hint is useful; a whole map/container's
         -- generic name must not turn every AI below it into an enemy.
         if (current == instance or current == nearestModel) and H.npcNameHint(current.Name) then return true end
@@ -1886,38 +1945,61 @@ function H.npcBounds(instance)
 end
 
 function H.npcProximity(position)
-    local closest3D, closestXZ, highestTop = math.huge, math.huge, -math.huge
-    local seen = {}
-    for instance in pairs(S.npcs) do
-        if H.hostileNPC(instance) then
-            -- Measure actual body parts instead of the empty space inside a
-            -- container's bounding box. This also excludes friendly/dead children.
-            local bodies = instance:IsA("BasePart") and {instance} or instance:GetDescendants()
-            for _, part in ipairs(bodies) do
-                if part:IsA("BasePart") and not seen[part] and not H.npcExcluded(part) then
-                    seen[part] = true
-                    local bounds, size = H.npcBounds(part)
-                    if H.finiteVector(bounds.Position) and H.finiteVector(size) then
-                        local half = H.npcExtents(bounds, size)
-                        local offset = position - bounds.Position
-                        local flat = Vector3.new(math.max(0, math.abs(offset.X) - half.X), 0,
-                            math.max(0, math.abs(offset.Z) - half.Z)).Magnitude
-                        closest3D = math.min(closest3D, H.boxDistance(position, bounds, size))
-                        closestXZ = math.min(closestXZ, flat)
-                        if flat <= Config.NPCStopDistance then
-                            highestTop = math.max(highestTop, bounds.Position.Y + half.Y)
-                        end
-                    end
+    -- Monster-only scanning is LOCAL and ON-DEMAND; no Workspace-wide index.
+    if not (S.flags.monster or S.hovering) or not S.context then
+        return math.huge, math.huge, -math.huge
+    end
+    local overlap = S.npcOverlap
+    if not overlap then
+        overlap = OverlapParams.new()
+        overlap.FilterType = Enum.RaycastFilterType.Exclude
+        overlap.MaxParts = Config.NPCMaxLocalParts
+        S.npcOverlap = overlap
+    end
+    overlap.FilterDescendantsInstances = {S.context.character}
+    -- During a 15-stud hover, include nearby ground-level worm segments.
+    local center = position
+    if S.hovering then center = position - Vector3.new(0, Config.NPCLiftHeight * 0.5, 0) end
+    local parts = Workspace:GetPartBoundsInRadius(center, Config.NPCScanRadius, overlap)
+    local nearest3D, nearestXZ, highestTop = math.huge, math.huge, -math.huge
+    local excluded, seen, classified, excludedOwner = {}, {}, {}, {}
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") and not seen[part] then
+            seen[part] = true
+            local owner = part:FindFirstAncestorOfClass("Model") or part.Parent
+            if owner == Workspace or owner == nil then owner = part end
+            local hostile = classified[owner]
+            if hostile == nil then
+                hostile = not H.npcExcluded(part) and H.hostileNPC(part)
+                classified[owner] = hostile
+            end
+            if hostile then
+                local bounds, size = part.CFrame, part.Size
+                local half = H.npcExtents(bounds, size)
+                local offset = position - bounds.Position
+                local flat = Vector3.new(math.max(0, math.abs(offset.X) - half.X), 0,
+                    math.max(0, math.abs(offset.Z) - half.Z)).Magnitude
+                local distance = H.boxDistance(position, bounds, size)
+                nearest3D = math.min(nearest3D, distance)
+                nearestXZ = math.min(nearestXZ, flat)
+                if flat <= Config.NPCStopDistance then
+                    highestTop = math.max(highestTop, bounds.Position.Y + half.Y)
+                end
+                -- Ignore the actual NPC rig when raycasting to find safe ground.
+                if not excludedOwner[owner] then
+                    table.insert(excluded, owner)
+                    excludedOwner[owner] = true
                 end
             end
         end
     end
-    return closest3D, closestXZ, highestTop
+    S.npcNearbyIgnore = excluded
+    return nearest3D, nearestXZ, highestTop
 end
 
 function H.npcEscapeTarget(minimumY)
     local root = S.context.root
-    for _, extra in ipairs({0, 25, 60, 120}) do
+    for _, extra in ipairs({0, 3, 7, 12, 20}) do
         local target = root.CFrame + Vector3.new(0, minimumY + extra - root.Position.Y, 0)
         -- This is a teleport: a ceiling along the old path must not block a clear
         -- destination above it. The active skywalk owns noclip for the character.
@@ -1929,10 +2011,10 @@ end
 function H.npcLandingAt(target)
     if not H.ready() then return nil end
     local ctx = S.context
+    -- Refresh nearby enemies immediately before choosing a landing spot.
+    H.npcProximity(target.Position)
     local exclusions = {ctx.character}
-    for instance in pairs(S.npcs) do
-        if H.hostileNPC(instance) then table.insert(exclusions, instance) end
-    end
+    for _, instance in ipairs(S.npcNearbyIgnore) do table.insert(exclusions, instance) end
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = exclusions
@@ -1951,6 +2033,8 @@ end
 function H.updateNPCs()
     if not S.flags.monster or not H.ready() or S.flags.lock or S.flying then return end
     local position, now = S.context.root.Position, os.clock()
+    if now - S.npcLastScanAt < Config.NPCScanInterval then return end
+    S.npcLastScanAt = now
     local closest3D, closestXZ, highestTop = H.npcProximity(position)
     if not S.hovering then
         if closest3D <= Config.NPCStartDistance then
@@ -1973,6 +2057,7 @@ function H.updateNPCs()
             local target = H.npcEscapeTarget(highestTop + Config.NPCClearanceHeight)
             if target and H.moveRoot(target) then
                 S.hoverY, S.lastNPCLift = target.Position.Y, now
+                if S.mover and S.mover.heightHold then S.mover.heightHold.Position = target.Position end
                 H.zeroRigVelocity()
             end
         end
@@ -2043,11 +2128,18 @@ function H.updateMover()
         if direction.Magnitude > 0.01 and S.mover.orientation then
             S.mover.orientation.CFrame = CFrame.lookAt(Vector3.zero, direction)
         end
-        direction = Vector3.new(direction.X * speed,
-            math.clamp((S.hoverY - ctx.root.Position.Y) * 8, -40, 80), direction.Z * speed)
+        local flat = direction.Magnitude > 1 and direction.Unit or direction
+        direction = Vector3.new(flat.X * speed, 0, flat.Z * speed)
+        if S.mover.heightHold then
+            S.mover.heightHold.Position = Vector3.new(ctx.root.Position.X, S.hoverY, ctx.root.Position.Z)
+        end
         ctx.root.AssemblyAngularVelocity = Vector3.zero
     end
-    S.mover.velocity.VectorVelocity = direction
+    if S.hovering then
+        S.mover.velocity.PlaneVelocity = Vector2.new(direction.X, direction.Z)
+    else
+        S.mover.velocity.VectorVelocity = direction
+    end
 end
 
 -- Shield against locally simulated flings without freezing ordinary movement.
@@ -3069,12 +3161,13 @@ function H.setToggle(key, enabled)
             if enabled then H.notice("Flight armed: double-tap jump to fly", 4) end
         elseif key == "monster" then
             if enabled then
-                -- Prioritize existing monsters before the rest of a large map's
-                -- batched hazard index. New descendants still use the normal queue.
-                H.primeEnemyIndex()
-                S.lastNPCLift = -math.huge
+                S.npcLastScanAt, S.lastNPCLift = -math.huge, -math.huge
+                S.npcOverlap = nil
                 H.updateNPCs()
-            else H.endHover(true) end
+            else
+                H.endHover(true)
+                S.npcOverlap, S.npcNearbyIgnore = nil, {}
+            end
         elseif key == "noclip" then
             if enabled then H.noclip("noclip", true) else H.release("noclip") end
         elseif key == "fling" then
@@ -3136,6 +3229,9 @@ function H.setToggle(key, enabled)
         end
         H.report("Toggle " .. key, message)
     end
+    if key == "lock" or key == "monster" or key == "aim" or key == "bullet" then
+        H.clearInactiveIndexes()
+    end
     H.updateSwitches()
     return ok
 end
@@ -3153,7 +3249,8 @@ function H.cleanupCharacter()
     S.afkLastPulse, S.afkPulseUntil, S.afkPostPulseUntil = os.clock(), nil, -math.huge
     S.safeRoot, S.previousHealth = nil, nil
     S.safeTime, S.healing, S.lastDrop, S.lastJump = -math.huge, false, -math.huge, -math.huge
-    S.lastNPCLift = -math.huge
+    S.lastNPCLift, S.npcLastScanAt = -math.huge, -math.huge
+    S.npcOverlap, S.npcNearbyIgnore = nil, {}
     S.lastJumpRequest = -math.huge
     S.lastDamageAt, S.lastSevereThreatAt = -math.huge, -math.huge
     S.homeThreatAt, S.lastEmergency = -math.huge, -math.huge
@@ -3402,7 +3499,7 @@ S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true, BackgroundColor
 H.corner(S.ui.panel, 12)
 H.make("UIStroke", {Thickness = 1, Color = Color3.fromRGB(61, 72, 95)}, S.ui.panel)
 S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -82, 0, 43), Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1, Text = "GR33D  v7.11", TextColor3 = Color3.fromRGB(234, 240, 250),
+    BackgroundTransparency = 1, Text = "GR33D  v7.12", TextColor3 = Color3.fromRGB(234, 240, 250),
     TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
 S.ui.minimize = H.make("TextButton", {Text = "-", BackgroundColor3 = Color3.fromRGB(37, 43, 57),
     TextColor3 = Color3.fromRGB(234, 240, 250), TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
@@ -3594,25 +3691,30 @@ H.connect(UserInputService.JumpRequest, function()
 end)
 
 H.connect(Workspace.DescendantAdded, function(instance)
-    if S.alive then
-        table.insert(S.pending, instance)
-        if S.flags.lock or S.flags.monster or S.flags.aim or S.flags.bullet then
-            -- An active protection switch must see new threats immediately.
-            local ok, message = pcall(H.watchObject, instance)
-            if not ok then H.report("New object index", message) end
-        end
+    if not S.alive or not H.worldIndexNeeded() then return end
+    local ok, message = pcall(H.watchObject, instance)
+    if not ok then H.report("New indexed object", message) end
+end)
+H.connect(Workspace.DescendantRemoving, function(instance)
+    if S.watchers[instance] or S.hazards[instance] or S.npcs[instance] then
+        H.removeObject(instance)
     end
 end)
-H.connect(Workspace.DescendantRemoving, H.removeObject)
-for _, tags in ipairs({Config.HazardTags, Config.HostileTags, Config.FriendlyTags, {"ProtectionIgnore"}}) do
+for _, tags in ipairs({Config.HazardTags, Config.HostileTags,
+    Config.FriendlyTags, {"ProtectionIgnore"}}) do
     for _, tag in ipairs(tags) do
         H.connect(CollectionService:GetInstanceAddedSignal(tag), function(instance)
-            if instance:IsDescendantOf(Workspace) then H.watchObject(instance); H.refreshObject(instance); H.queueBranch(instance) end
+            if H.worldIndexNeeded() and instance:IsDescendantOf(Workspace) then
+                H.watchObject(instance)
+                H.refreshObject(instance)
+            end
         end)
-        H.connect(CollectionService:GetInstanceRemovedSignal(tag), function(instance) H.refreshObject(instance); H.queueBranch(instance) end)
+        H.connect(CollectionService:GetInstanceRemovedSignal(tag), function(instance)
+            if H.worldIndexNeeded() then H.refreshObject(instance) end
+        end)
     end
 end
-for _, instance in ipairs(Workspace:GetDescendants()) do table.insert(S.pending, instance) end
+-- IMPORTANT: no Workspace:GetDescendants() at startup; indexes start empty.
 
 H.connect(player.CharacterAdded, H.beginCharacter)
 H.connect(player.CharacterRemoving, function(character)
@@ -3690,7 +3792,8 @@ H.connect(RunService.Heartbeat, function(deltaTime)
     end
     -- Initial indexing is spread across frames instead of blocking on a large map.
     local processed = 0
-    while S.pendingIndex <= #S.pending and processed < Config.IndexBatchSize do
+    while H.worldIndexNeeded() and S.pendingIndex <= #S.pending
+        and processed < Config.IndexBatchSize do
         local instance = S.pending[S.pendingIndex]
         S.pendingIndex, processed = S.pendingIndex + 1, processed + 1
         local ok, message = pcall(H.watchObject, instance)
@@ -3718,7 +3821,8 @@ H.connect(RunService.Heartbeat, function(deltaTime)
     if S.ui.status and S.ui.status.Parent then
         if os.clock() < S.noticeUntil then S.ui.status.Text = S.notice
         elseif not H.ready() then S.ui.status.Text = "Waiting for a living character"
-        elseif S.pendingIndex <= #S.pending then S.ui.status.Text = "Indexing hazards and NPCs..."
+        elseif H.worldIndexNeeded() and S.pendingIndex <= #S.pending then
+            S.ui.status.Text = "Indexing enabled protection features..."
         elseif S.escape and S.escape.mode == "emergency" then
             S.ui.status.Text = "Emergency evasion: lock released; tracking pursuit"
         elseif S.escape and S.escape.mode == "manual" then
@@ -3743,4 +3847,4 @@ H.connect(RunService.Heartbeat, function(deltaTime)
 end)
 
 H.updateSwitches()
-print("[GR33D v7.11] Swept hazard prediction, persistent chase evasion, hostile AI skywalk, custom movement, and compatible weapon modes loaded.")
+print("[GR33D v7.12] Lazy indexing, local 15-stud skywalk, safe landing and existing controls loaded.")
