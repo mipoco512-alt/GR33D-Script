@@ -1,4 +1,4 @@
--- GR33D Panel v7.18: faster verified skywalk descent + hostile-only camera aim
+-- GR33D Panel v7.20: rapid lethal-projectile dodge; external TP permission removed
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -28,6 +28,15 @@ local Config = {
     HazardPredictionSteps = 6,
     UrgentImpactTime = 0.22,
     UrgentRelocateCooldown = 0.08,
+    -- The urgent pass only runs while Position Lock is enabled. It scans nearby
+    -- potential projectiles between normal hazard snapshots, never all of Workspace.
+    UrgentScanInterval = 0.025, -- ~40 checks/s cap; avoids per-frame overlap scans
+    UrgentScanRadius = 68,
+    UrgentScanMaxParts = 125,
+    UrgentExtremeSpeed = 100, -- suspiciously fast; final impact test still required
+    UrgentCollisionTime = 0.28,
+    UrgentTeleportProximity = 18,
+    UrgentDestinationAttempts = 8,
     IndexBatchSize = 80,
     LockLocalScanInterval = 0.14, -- bounded local scan, no whole-map synchronous pass
     LockLocalScanRadius = 125,
@@ -81,6 +90,8 @@ local Config = {
     FlingAngularThreshold = 20,
     FlingRecoveryCooldown = 0.05, -- rate-limit notices, not actual protection
     FlingImpulseDeltaThreshold = 26, -- suspicious single-step speed change (studs/s)
+    FlingMovingImpulseThreshold = 65, -- violent impulses during deliberate walking still count
+    ManualTeleportGrace = 1.20, -- authorized relocation must not be undone as a fling
     FlingFrameDistance = 5.5, -- unusually large displacement in one simulation step
     FlingStationaryMaxSpeed = 4.5,
     FlingStationaryMaxVertical = 7,
@@ -165,6 +176,7 @@ local S = {
     flingHoldTarget = nil, flingPauseUntil = -math.huge, flingInputUntil = -math.huge,
     flingSnapshot = nil, flingLastStableCF = nil, flingLastStableAt = -math.huge,
     flingRecovering = false,
+    manualTeleportUntil = -math.huge, manualTeleportLastTarget = nil,
     lockSuspended = false, escapeHold = nil, lastEscapeDriftCorrection = -math.huge,
     lastChaseRelocate = -math.huge, lastChaseThreatAt = -math.huge,
     impactEntries = {}, recentHazard = nil,
@@ -1175,6 +1187,140 @@ function H.selectEscapeTarget(candidates)
         end
     end
     return best
+end
+
+-- Urgent-only escape: consider a few clear destinations before the more
+-- expensive normal emergency search. This does not relax the normal hazard
+-- classification, ordinary dodge distances, or built-in manual teleports.
+function H.urgentImpactEscape(threat)
+    if not S.flags.lock or not H.ready() or not threat then return false end
+    local now = os.clock()
+    if now - (S.urgentLastMove or -math.huge) < Config.UrgentRelocateCooldown then return false end
+    if now < S.manualTeleportUntil or (S.escape and S.escape.mode == "manual") then return false end
+    local current = S.context.root.CFrame
+    local home = S.escape and S.escape.home or S.lockTarget or current
+    local orientation = current - current.Position
+    local away, side = H.escapeDirections(threat, current)
+    local height = S.escape and 26 or Config.EmergencyHeight
+    local rise = Vector3.new(0, height, 0)
+    local offsets = {rise, rise + side * 25, rise - side * 25,
+        rise + away * 30, rise + away * 36 + side * 22,
+        rise + away * 36 - side * 22, rise - away * 25 + side * 24,
+        rise - away * 25 - side * 24}
+    -- Capture the other known moving hazards once, not on each candidate.
+    local known = H.hazardSnapshot()
+    local checked = 0
+    for _, offset in ipairs(offsets) do
+        if checked >= Config.UrgentDestinationAttempts then break end
+        checked = checked + 1
+        local candidate = CFrame.new(current.Position + offset) * orientation
+        if candidate.Position.Y <= home.Position.Y + Config.ChaseMaxHeight
+            and H.finiteVector(candidate.Position)
+            and H.clearSpace(candidate) then
+            local unsafe = H.threatAt(threat, candidate.Position, Vector3.zero, false)
+            if not unsafe then
+                for _, info in ipairs(known) do
+                    if info.instance ~= threat.instance and H.threatAt(info, candidate.Position, Vector3.zero, false) then
+                        unsafe = true
+                        break
+                    end
+                end
+            end
+            if not unsafe and H.beginEscapeMove(candidate, "emergency", home, "imminent high-speed hazard") then
+                S.urgentLastMove = now
+                S.lastEmergency, S.lastEscape, S.lastChaseRelocate = now, now, now
+                S.escape.pursuer, S.escape.lastThreatAt = threat.instance, now
+                H.notice("URGENT DODGE: rapid hazardous object", 2)
+                return true
+            end
+        end
+    end
+    -- Normal emergency logic retains its broader destination search as fallback.
+    S.urgentLastMove = now
+    return H.emergencyEscape("fast lethal object", threat)
+end
+
+-- The urgent pass uses cheap predicted-approach math BEFORE heavy hazard metadata.
+-- A newly arrived fast object can be detected without waiting for the ordinary
+-- 0.14-second nearby hazard indexing pass. Ignore harmless objects moving away.
+function H.urgentRawOnCourse(position, part, velocity)
+    if not H.finiteVector(velocity) or velocity.Magnitude < Config.UrgentExtremeSpeed then
+        return false
+    end
+    local delta = position - part.Position
+    local speedSquared = velocity:Dot(velocity)
+    if speedSquared < 1 then return false end
+    local approach = delta:Dot(velocity) / speedSquared
+    if approach < -0.01 or approach > Config.UrgentCollisionTime then return false end
+    local projected = part.Position + velocity * math.max(0, approach)
+    -- Conservative geometric prefilter; exact oriented-box impact follows.
+    local width = math.min(30, part.Size.Magnitude * 0.5)
+    return (position - projected).Magnitude <= width + Config.HazardMargin + 4
+end
+
+-- Extra hazard query only runs when Position Lock is active. This is bounded
+-- and independently throttled, so the normal panel features keep their cadence.
+function H.urgentImpactProbe()
+    if not S.flags.lock or not H.ready() then return false end
+    local now = os.clock()
+    -- The panel's two built-in TP actions are explicitly authorized; they
+    -- must not be cancelled by urgent hazard sensing during their short grace.
+    if now < S.manualTeleportUntil or (S.escape and S.escape.mode == "manual") then return false end
+    if now - (S.urgentLastScan or -math.huge) < Config.UrgentScanInterval then return false end
+    S.urgentLastScan = now
+    local ctx = S.context
+    local position = ctx.root.Position
+    local overlap = S.urgentOverlap
+    if not overlap then
+        overlap = OverlapParams.new()
+        overlap.FilterType = Enum.RaycastFilterType.Exclude
+        overlap.MaxParts = Config.UrgentScanMaxParts
+        S.urgentOverlap = overlap
+    end
+    overlap.FilterDescendantsInstances = {ctx.character}
+    local parts = Workspace:GetPartBoundsInRadius(position, Config.UrgentScanRadius, overlap)
+    local imminent, closestTime = nil, math.huge
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") then
+            local velocity = part.AssemblyLinearVelocity
+            local fastApproach = H.urgentRawOnCourse(position, part, velocity)
+            -- Previously indexed hazards need samples even if a grabbed object
+            -- is teleported with zero AssemblyLinearVelocity.
+            local tracked = S.hazards[part] or S.motion[part]
+            local closeToBody = (part.Position - position).Magnitude <=
+                Config.UrgentTeleportProximity + math.min(12, part.Size.Magnitude * 0.5)
+            if fastApproach or (tracked and closeToBody) or (closeToBody and H.hazardCandidate(part)) then
+                -- Always validate lethality; nonlethal physics props are not
+                -- grounds for an emergency teleport.
+                if tracked or H.hazardCandidate(part) then
+                    local info = H.hazardInfo(part)
+                    if info then
+                        local gap = H.boxDistance(position, info.bounds, info.size) - info.radius
+                        local jumpedNear = info.teleported and gap <= Config.UrgentTeleportProximity
+                        local touching = info.explicit and gap <= Config.HazardMargin + 2
+                        local onCourse, t = false, math.huge
+                        if fastApproach or (info.moving and
+                            info.velocity.Magnitude >= Config.UrgentExtremeSpeed) then
+                            local hit, _, time = H.threatAt(info, position, Vector3.zero, true)
+                            onCourse, t = hit, time
+                        end
+                        if jumpedNear or touching or (onCourse and t <= Config.UrgentCollisionTime) then
+                            local rank = (jumpedNear or touching) and 0 or t
+                            if rank < closestTime then
+                                imminent, closestTime = info, rank
+                            end
+                        end
+                        if not S.hazards[part] then
+                            S.hazards[part] = true
+                            S.hazardCache = nil
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if imminent then return H.urgentImpactEscape(imminent) end
+    return false
 end
 
 -- Repeated pursuit widens the search, changes its angle and checks every
@@ -2332,7 +2478,8 @@ end
 function H.flingCanOperate(ctx)
     -- Important: never fight Lock On's temporary escape, voluntary flight,
     -- hover, teleporting, or another feature's movement constraint.
-    return S.flags.fling and not S.flags.lock and not S.escape
+    return S.flags.fling and os.clock() >= S.manualTeleportUntil
+        and not S.flags.lock and not S.escape
         and not S.mover and not S.flying and not S.hovering
         and ctx.character:GetAttribute("ProtectionAllowHighVelocity") ~= true
 end
@@ -2364,6 +2511,20 @@ function H.flingRestore(reason, fallback)
     S.flingSnapshot = nil
     S.flingRecovering = false
     if not ok then H.report("Anti-Fling recovery", message) end
+end
+
+-- Only the panel's own teleport buttons authorize a position jump.
+-- Unsolicited external/server displacement cannot rebase the saved lock.
+function H.markOwnTeleport(target)
+    local now = os.clock()
+    S.manualTeleportUntil = now + Config.ManualTeleportGrace
+    S.manualTeleportLastTarget = target
+    S.flingSnapshot = nil
+    S.flingLastStableCF = target
+    S.flingLastStableAt = now
+    H.releaseFlingHold(Config.ManualTeleportGrace)
+    H.releaseIdle(true)
+    S.idleBlockedUntil = math.max(S.idleBlockedUntil, S.manualTeleportUntil)
 end
 
 function H.updateFling(phase, deltaTime)
@@ -2449,7 +2610,9 @@ function H.updateFling(phase, deltaTime)
         local velocityJump = (linear - previous.velocity).Magnitude
         -- Ignore large acceleration if controlled movement is already ongoing,
         -- but never ignore extreme spins / impulses in avatar body parts.
-        if not hasInput and not humanoid.Jump and velocityJump > Config.FlingImpulseDeltaThreshold
+        local shockThreshold = hasInput and Config.FlingMovingImpulseThreshold
+            or Config.FlingImpulseDeltaThreshold
+        if not humanoid.Jump and velocityJump > shockThreshold
             and not H.isAuthorizedJumpImpulse(ctx, linear, previous.velocity) then
             bad = true
         elseif not H.flingDisplacementAllowed(ctx, root.Position - previous.cframe.Position,
@@ -2528,7 +2691,7 @@ function H.guardAFKPosition()
     local input = H.inputMoveVector()
     if input and input.Magnitude > 0.06 then return end
     local now = os.clock()
-    if now < S.idleBlockedUntil then return end
+    if now < S.idleBlockedUntil or now < S.manualTeleportUntil then return end
     if not S.afkPulseUntil and now >= S.afkPostPulseUntil
         and ctx.humanoid.MoveDirection.Magnitude > 0.06 then return end
     H.claim(ctx.root, "Anchored", true, "idle")
@@ -2654,8 +2817,7 @@ function H.teleport(target, label)
         return false
     end
     H.stopMover()
-    H.releaseIdle(true)
-    H.releaseFlingHold(0.9)
+    H.markOwnTeleport(chosen)
     S.flingSnapshot = nil
     S.afkPulseUntil = nil
     S.afkPostPulseUntil = -math.huge
@@ -2664,11 +2826,13 @@ function H.teleport(target, label)
     if S.flags.lock then
         if not H.beginEscapeMove(chosen, "manual", chosen, label) then
             S.lockTarget, S.escape = oldLock, oldEscape
+            S.manualTeleportUntil = -math.huge
             H.notice("Teleport move failed", 4)
             return false
         end
         S.damageEvents, S.impactEntries = {}, {}
     elseif not H.moveRoot(chosen) then
+        S.manualTeleportUntil = -math.huge
         H.notice("Teleport move failed", 4)
         return false
     end
@@ -2961,7 +3125,8 @@ end
 
 function H.allowFlingPositionRestore()
     local now = os.clock()
-    return now >= (S.runExternalCorrectionUntil or -math.huge)
+    return now >= S.manualTeleportUntil
+        and now >= (S.runExternalCorrectionUntil or -math.huge)
         and now >= (S.runBackoffUntil or -math.huge)
 end
 
@@ -3438,6 +3603,8 @@ function H.sampleNearbyHazards(force)
 end
 
 function H.primeHazardIndex()
+    S.urgentLastScan, S.urgentLastMove = -math.huge, -math.huge
+    S.urgentOverlap = nil
     S.hazardCache, S.lastProtectionScanAt = nil, -math.huge
     S.lockOverlap, S.lockLocalScanAt = nil, -math.huge
     H.sampleNearbyHazards(true)
@@ -3577,10 +3744,13 @@ function H.cleanupCharacter()
     S.flingHoldTarget, S.flingSnapshot, S.flingLastStableCF = nil, nil, nil
     S.flingLastStableAt, S.flingPauseUntil, S.flingInputUntil = -math.huge, -math.huge, -math.huge
     S.flingRecovering = false
+    S.manualTeleportUntil, S.manualTeleportLastTarget = -math.huge, nil
     S.lockSuspended, S.escapeHold = false, nil
     S.lastChaseRelocate, S.lastChaseThreatAt = -math.huge, -math.huge
     S.escapeHistory, S.hazardCache = {}, nil
     S.lastProtectionScanAt = -math.huge
+    S.urgentLastScan, S.urgentLastMove = -math.huge, -math.huge
+    S.urgentOverlap = nil
 end
 
 function H.beginCharacter(character)
@@ -3817,7 +3987,7 @@ S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true, BackgroundColor
 H.corner(S.ui.panel, 12)
 H.make("UIStroke", {Thickness = 1, Color = Color3.fromRGB(61, 72, 95)}, S.ui.panel)
 S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -82, 0, 43), Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1, Text = "GR33D  v7.18", TextColor3 = Color3.fromRGB(234, 240, 250),
+    BackgroundTransparency = 1, Text = "GR33D  v7.19", TextColor3 = Color3.fromRGB(234, 240, 250),
     TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
 S.ui.minimize = H.make("TextButton", {Text = "-", BackgroundColor3 = Color3.fromRGB(37, 43, 57),
     TextColor3 = Color3.fromRGB(234, 240, 250), TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
@@ -4053,6 +4223,9 @@ function H.physicsTick(deltaTime)
     H.updateAFK()
     H.updateGuidedBullets(deltaTime)
     if S.flags.lock then
+        -- Check extreme, incoming hazards between regular position-lock scans.
+        -- A successful urgent dodge is already in S.escape; keep its hold.
+        H.urgentImpactProbe()
         H.updateEscape()
         if S.escape then H.updateEscapeHold() else H.applyLock() end
         return
@@ -4166,4 +4339,4 @@ H.connect(RunService.Heartbeat, function(deltaTime)
 end)
 
 H.updateSwitches()
-print("[GR33D v7.18] Local lock scanning, enemy-only PvP aim and steadier AFK hold/pulse loaded.")
+print("[GR33D v7.19] Local lock scanning, enemy-only PvP aim and steadier AFK hold/pulse loaded.")
