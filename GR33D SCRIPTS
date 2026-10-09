@@ -3036,8 +3036,8 @@ end
 function H.updateSwitches()
     for key, switch in pairs(S.switches) do
         local enabled = S.flags[key]
-        switch.button.BackgroundColor3 = enabled and Color3.fromRGB(42, 176, 117) or Color3.fromRGB(48, 50, 61)
-        switch.knob.Position = enabled and UDim2.new(1, -18, 0.5, -7) or UDim2.new(0, 4, 0.5, -7)
+        switch.button.BackgroundColor3 = enabled and Color3.fromRGB(39, 168, 131) or Color3.fromRGB(55, 66, 83)
+        switch.knob.Position = enabled and UDim2.new(1, -23, 0.5, -9) or UDim2.new(0, 4, 0.5, -9)
     end
 end
 
@@ -4207,7 +4207,19 @@ if previousGui then
     previousGui:Destroy()
 end
 
--- Compact responsive panel. No deprecated Draggable property or manual canvas height.
+-- v7.22 UI redesign: gameplay callbacks below are unchanged.
+-- Screen-aware docking; categorized tabs; touch-friendly controls; fixed status footer.
+local UI = {
+    surface = Color3.fromRGB(15, 20, 29),
+    header = Color3.fromRGB(23, 34, 48),
+    card = Color3.fromRGB(27, 35, 48),
+    border = Color3.fromRGB(56, 70, 88),
+    text = Color3.fromRGB(237, 243, 249),
+    muted = Color3.fromRGB(159, 176, 196),
+    accent = Color3.fromRGB(39, 191, 152),
+    off = Color3.fromRGB(55, 66, 83),
+}
+
 function H.make(className, properties, parent)
     local instance = Instance.new(className)
     for property, value in pairs(properties or {}) do instance[property] = value end
@@ -4224,53 +4236,130 @@ function H.viewport()
     return camera and camera.ViewportSize or Vector2.new(800, 600)
 end
 
+function H.openUITab(key)
+    if not S.ui.pages or not S.ui.pages[key] then return end
+    S.ui.activeTab = key
+    for name, entry in pairs(S.ui.pages) do
+        local active = name == key
+        entry.scroll.Visible = active and not S.minimized
+        entry.button.BackgroundColor3 = active and Color3.fromRGB(37, 67, 69)
+            or Color3.fromRGB(28, 37, 51)
+        entry.button.TextColor3 = active and Color3.fromRGB(218, 255, 245) or UI.muted
+        entry.accent.Visible = active
+    end
+    if S.ui.sectionCaption then
+        S.ui.sectionCaption.Text = S.ui.pages[key].description
+    end
+end
+
+function H.useUITab(key)
+    assert(S.ui.pages and S.ui.pages[key], "Missing panel category: " .. tostring(key))
+    S.ui.scroll = S.ui.pages[key].scroll -- controls are built into the selected tab
+end
+
+function H.section(name, description)
+    S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
+    local group = H.make("Frame", {Size = UDim2.new(1, 0, 0, 53),
+        BackgroundTransparency = 1, LayoutOrder = S.ui.nextOrder}, S.ui.scroll)
+    H.make("Frame", {Size = UDim2.fromOffset(4, 27), Position = UDim2.fromOffset(1, 13),
+        BorderSizePixel = 0, BackgroundColor3 = UI.accent}, group)
+    H.make("TextLabel", {Position = UDim2.fromOffset(15, 5), Size = UDim2.new(1, -15, 0, 23),
+        BackgroundTransparency = 1, Text = name, TextSize = 14, Font = Enum.Font.GothamBold,
+        TextColor3 = UI.text, TextXAlignment = Enum.TextXAlignment.Left}, group)
+    H.make("TextLabel", {Position = UDim2.fromOffset(15, 27), Size = UDim2.new(1, -15, 0, 20),
+        BackgroundTransparency = 1, Text = description, TextSize = 10, Font = Enum.Font.Gotham,
+        TextColor3 = UI.muted, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd}, group)
+end
+
 function H.layout()
+    if not S.ui.panel then return end
     local viewport = H.viewport()
-    local width = math.min(270, math.max(170, viewport.X - 16))
-    local height = math.min(535, math.max(150, viewport.Y - 24))
-    local panel = S.ui.panel
+    local width = math.max(168, math.min(372, viewport.X - 20))
+    local height = math.max(158, math.min(658, viewport.Y - 82))
     local size = S.minimized and Vector2.new(52, 52) or Vector2.new(width, height)
+    local panel = S.ui.panel
     panel.Size = UDim2.fromOffset(size.X, size.Y)
-    local position = panel.Position
-    panel.Position = UDim2.fromOffset(math.clamp(position.X.Offset, 4, math.max(4, viewport.X - size.X - 4)),
-        math.clamp(position.Y.Offset, 4, math.max(4, viewport.Y - size.Y - 4)))
-    S.ui.scroll.Visible, S.ui.status.Visible, S.ui.title.Visible = not S.minimized, not S.minimized, not S.minimized
-    S.ui.close.Visible = not S.minimized
-    S.ui.minimize.Size = S.minimized and UDim2.fromScale(1, 1) or UDim2.fromOffset(28, 28)
-    S.ui.minimize.Position = S.minimized and UDim2.fromOffset(0, 0) or UDim2.new(1, -66, 0, 7)
-    S.ui.minimize.Text = S.minimized and "+" or "-"
+
+    local x, y = panel.Position.X.Offset, panel.Position.Y.Offset
+    if S.ui.dockedRight and not S.dragging then
+        x = viewport.X - size.X - 12
+        y = math.min(58, math.max(4, viewport.Y - size.Y - 4))
+    end
+    panel.Position = UDim2.fromOffset(
+        math.clamp(x, 4, math.max(4, viewport.X - size.X - 4)),
+        math.clamp(y, 4, math.max(4, viewport.Y - size.Y - 4)))
+
+    local show = not S.minimized
+    for _, item in ipairs({S.ui.header, S.ui.tabs, S.ui.sectionCaption,
+        S.ui.footer, S.ui.close}) do
+        if item then item.Visible = show end
+    end
+    if S.ui.pages then
+        for key, entry in pairs(S.ui.pages) do
+            entry.scroll.Visible = show and S.ui.activeTab == key
+            entry.scroll.Size = UDim2.new(1, -20, 1, -165)
+            entry.scroll.Position = UDim2.fromOffset(10, 111)
+        end
+    end
+    S.ui.tabs.Size = UDim2.new(1, -20, 0, 39)
+    S.ui.tabs.Position = UDim2.fromOffset(10, 68)
+    S.ui.sectionCaption.Position = UDim2.fromOffset(0, 0)
+    S.ui.sectionCaption.Size = UDim2.fromOffset(0, 0)
+    S.ui.sectionCaption.Visible = false
+    S.ui.footer.Position = UDim2.new(0, 0, 1, -54)
+    S.ui.footer.Size = UDim2.new(1, 0, 0, 54)
+    if S.ui.pages then
+        local tabWidth = math.max(70, math.floor((width - 22 - 4 * 5) / 5))
+        for _, entry in pairs(S.ui.pages) do
+            entry.button.Size = UDim2.fromOffset(tabWidth, 36)
+        end
+    end
+    S.ui.title.Text = width < 260 and "GR33D" or "GR33D   v7.22"
+    S.ui.title.TextSize = width < 260 and 16 or 19
+    if S.ui.tagline then S.ui.tagline.Visible = show and width >= 280 end
+    S.ui.minimize.Size = show and UDim2.fromOffset(30, 30) or UDim2.fromScale(1, 1)
+    S.ui.minimize.Position = show and UDim2.new(1, -73, 0, 17) or UDim2.fromOffset(0, 0)
+    S.ui.minimize.Text = show and "−" or "G"
+    S.ui.minimize.BackgroundColor3 = show and Color3.fromRGB(43, 54, 70)
+        or Color3.fromRGB(26, 79, 70)
 end
 
 function H.row(label)
     S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
-    local row = H.make("Frame", {Size = UDim2.new(1, 0, 0, 37), BackgroundTransparency = 1,
+    local row = H.make("Frame", {Size = UDim2.new(1, 0, 0, 49),
+        BackgroundColor3 = UI.card, BorderSizePixel = 0,
         LayoutOrder = S.ui.nextOrder}, S.ui.scroll)
-    H.make("TextLabel", {Size = UDim2.new(1, -54, 1, 0), BackgroundTransparency = 1, Text = label,
-        TextColor3 = Color3.fromRGB(211, 216, 229), TextSize = 12, TextWrapped = true,
-        Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left}, row)
+    H.corner(row, 9)
+    H.make("UIStroke", {Color = Color3.fromRGB(39, 52, 69), Thickness = 1}, row)
+    H.make("TextLabel", {Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -91, 1, 0),
+        BackgroundTransparency = 1, Text = label, TextColor3 = UI.text, TextSize = 12,
+        TextWrapped = true, Font = Enum.Font.GothamMedium,
+        TextXAlignment = Enum.TextXAlignment.Left}, row)
     return row
 end
 
 function H.toggleRow(key, label)
     local row = H.row(label)
-    local button = H.make("TextButton", {Name = key .. "Toggle", Size = UDim2.fromOffset(43, 23),
-        Position = UDim2.new(1, -43, 0.5, -11), Text = "", AutoButtonColor = false,
-        BackgroundColor3 = Color3.fromRGB(48, 50, 61)}, row)
-    H.corner(button, 12)
-    local knob = H.make("Frame", {Size = UDim2.fromOffset(14, 14), Position = UDim2.new(0, 4, 0.5, -7),
-        BackgroundColor3 = Color3.fromRGB(240, 243, 250)}, button)
-    H.corner(knob, 8)
+    local button = H.make("TextButton", {Name = key .. "Toggle", Size = UDim2.fromOffset(50, 27),
+        Position = UDim2.new(1, -63, 0.5, -13), Text = "", AutoButtonColor = false,
+        BackgroundColor3 = UI.off}, row)
+    H.corner(button, 15)
+    local knob = H.make("Frame", {Size = UDim2.fromOffset(19, 19),
+        Position = UDim2.new(0, 4, 0.5, -9), BackgroundColor3 = UI.text}, button)
+    H.corner(knob, 10)
     S.switches[key] = {button = button, knob = knob}
     H.connect(button.Activated, function() H.setToggle(key, not S.flags[key]) end)
 end
 
 function H.numericRow(label, key, minimum, maximum, onChange)
     local row = H.row(label)
-    local input = H.make("TextBox", {Name = key .. "Input", Size = UDim2.fromOffset(58, 27),
-        Position = UDim2.new(1, -58, 0.5, -13), Text = tostring(S[key]), ClearTextOnFocus = false,
-        TextColor3 = Color3.fromRGB(240, 243, 250), BackgroundColor3 = Color3.fromRGB(37, 43, 57),
+    local input = H.make("TextBox", {Name = key .. "Input", Size = UDim2.fromOffset(65, 31),
+        Position = UDim2.new(1, -77, 0.5, -15), Text = tostring(S[key]), ClearTextOnFocus = false,
+        TextColor3 = UI.text, BackgroundColor3 = Color3.fromRGB(17, 25, 36),
         TextSize = 12, Font = Enum.Font.GothamBold}, row)
     H.corner(input, 6)
+    H.make("UIStroke", {Color = UI.border, Thickness = 1}, input)
     H.connect(input.FocusLost, function()
         local number = tonumber(input.Text)
         if H.finite(number) then
@@ -4284,10 +4373,12 @@ end
 
 function H.button(label, callback, color)
     S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
-    local button = H.make("TextButton", {Size = UDim2.new(1, 0, 0, 33), Text = label, LayoutOrder = S.ui.nextOrder,
-        TextColor3 = Color3.fromRGB(240, 243, 250), TextSize = 12, Font = Enum.Font.GothamBold,
-        BackgroundColor3 = color or Color3.fromRGB(44, 95, 143)}, S.ui.scroll)
-    H.corner(button, 7)
+    local button = H.make("TextButton", {Size = UDim2.new(1, 0, 0, 42), Text = label,
+        LayoutOrder = S.ui.nextOrder, AutoButtonColor = true,
+        TextColor3 = UI.text, TextSize = 12, Font = Enum.Font.GothamBold,
+        BackgroundColor3 = color or Color3.fromRGB(35, 103, 96)}, S.ui.scroll)
+    H.corner(button, 9)
+    H.make("UIStroke", {Color = Color3.fromRGB(61, 84, 102), Thickness = 0.7}, button)
     H.connect(button.Activated, function()
         local ok, message = pcall(callback)
         if not ok then H.report(label, message) end
@@ -4297,35 +4388,100 @@ end
 
 S.ui.gui = H.make("ScreenGui", {Name = "DevPanelGui", ResetOnSpawn = false, IgnoreGuiInset = true,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1000}, playerGui)
-S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true, BackgroundColor3 = Color3.fromRGB(19, 22, 30),
-    BorderSizePixel = 0, Position = UDim2.fromOffset(math.max(4, H.viewport().X - 282), 20)}, S.ui.gui)
-H.corner(S.ui.panel, 12)
-H.make("UIStroke", {Thickness = 1, Color = Color3.fromRGB(61, 72, 95)}, S.ui.panel)
-S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -82, 0, 43), Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1, Text = "GR33D  v7.21", TextColor3 = Color3.fromRGB(234, 240, 250),
-    TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
-S.ui.minimize = H.make("TextButton", {Text = "-", BackgroundColor3 = Color3.fromRGB(37, 43, 57),
-    TextColor3 = Color3.fromRGB(234, 240, 250), TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
-H.corner(S.ui.minimize, 8)
-S.ui.close = H.make("TextButton", {Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, -33, 0, 7),
-    Text = "x", BackgroundColor3 = Color3.fromRGB(98, 45, 55), TextColor3 = Color3.fromRGB(255, 239, 239),
-    TextSize = 15, Font = Enum.Font.GothamBold}, S.ui.panel)
-H.corner(S.ui.close, 8)
-S.ui.scroll = H.make("ScrollingFrame", {Size = UDim2.new(1, -22, 1, -91), Position = UDim2.fromOffset(11, 45),
-    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4, CanvasSize = UDim2.fromOffset(0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarImageColor3 = Color3.fromRGB(95, 117, 151)}, S.ui.panel)
-H.make("UIPadding", {PaddingRight = UDim.new(0, 7), PaddingBottom = UDim.new(0, 8)}, S.ui.scroll)
-H.make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, S.ui.scroll)
-S.ui.status = H.make("TextLabel", {Size = UDim2.new(1, -24, 0, 35), Position = UDim2.new(0, 12, 1, -40),
-    BackgroundTransparency = 1, Text = "Client protection tools", TextColor3 = Color3.fromRGB(133, 157, 190),
-    TextSize = 10, TextWrapped = true, Font = Enum.Font.Gotham, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
+S.ui.dockedRight = true
+S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true,
+    BackgroundColor3 = UI.surface, BorderSizePixel = 0,
+    ClipsDescendants = true, Position = UDim2.fromOffset(12, 12)}, S.ui.gui)
+H.corner(S.ui.panel, 14)
+H.make("UIStroke", {Thickness = 1.2, Color = UI.border}, S.ui.panel)
 
+S.ui.header = H.make("Frame", {Name = "DragHeader", Active = true, Size = UDim2.new(1, 0, 0, 64),
+    BackgroundColor3 = UI.header, BorderSizePixel = 0}, S.ui.panel)
+H.make("UIGradient", {Rotation = 0, Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(25, 57, 64)),
+    ColorSequenceKeypoint.new(1, UI.header)})}, S.ui.header)
+H.make("Frame", {Position = UDim2.fromOffset(12, 17), Size = UDim2.fromOffset(4, 30),
+    BackgroundColor3 = UI.accent, BorderSizePixel = 0}, S.ui.header)
+S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -115, 0, 37),
+    Position = UDim2.fromOffset(24, 8), BackgroundTransparency = 1,
+    Text = "GR33D   v7.22", TextColor3 = UI.text,
+    TextSize = 19, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.header)
+S.ui.tagline = H.make("TextLabel", {Position = UDim2.fromOffset(25, 35), Size = UDim2.new(1, -115, 0, 22),
+    Text = "ADAPTIVE DEFENSE  •  CONTROL CENTER", BackgroundTransparency = 1,
+    TextSize = 9, TextColor3 = Color3.fromRGB(176, 207, 209),
+    TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamMedium}, S.ui.header)
+S.ui.minimize = H.make("TextButton", {Text = "−", AutoButtonColor = true,
+    TextColor3 = UI.text, TextSize = 23, Font = Enum.Font.GothamBold,
+    BackgroundColor3 = Color3.fromRGB(43, 54, 70)}, S.ui.panel)
+H.corner(S.ui.minimize, 9)
+S.ui.close = H.make("TextButton", {Size = UDim2.fromOffset(30, 30),
+    Position = UDim2.new(1, -39, 0, 17), Text = "×", BackgroundColor3 = Color3.fromRGB(96, 49, 61),
+    TextColor3 = UI.text, TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
+H.corner(S.ui.close, 9)
+
+S.ui.tabs = H.make("ScrollingFrame", {Name = "Navigation", BackgroundTransparency = 1,
+    BorderSizePixel = 0, CanvasSize = UDim2.fromOffset(0, 0), AutomaticCanvasSize = Enum.AutomaticSize.X,
+    ScrollBarThickness = 0, ScrollingDirection = Enum.ScrollingDirection.X,
+    ElasticBehavior = Enum.ElasticBehavior.Never}, S.ui.panel)
+H.make("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal,
+    HorizontalAlignment = Enum.HorizontalAlignment.Left, VerticalAlignment = Enum.VerticalAlignment.Center,
+    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 5)}, S.ui.tabs)
+S.ui.pages = {}
+local tabs = {
+    {"defense", "DEFENSE", "Physics, hazards and recovery"},
+    {"move", "MOVE", "Movement and idle controls"},
+    {"combat", "COMBAT", "Targeting and compatible shots"},
+    {"watch", "WATCH", "Player observation and reports"},
+    {"tools", "TOOLS", "Teleport and emergency controls"},
+}
+for i, info in ipairs(tabs) do
+    local key, name, description = info[1], info[2], info[3]
+    local tab = H.make("TextButton", {Name = key .. "Tab", Text = name, LayoutOrder = i,
+        TextSize = 10, Font = Enum.Font.GothamBold, AutoButtonColor = true,
+        TextColor3 = UI.muted, BackgroundColor3 = Color3.fromRGB(28, 37, 51),
+        BorderSizePixel = 0}, S.ui.tabs)
+    H.corner(tab, 8)
+    local underline = H.make("Frame", {Name = "Selected", Size = UDim2.new(1, -20, 0, 3),
+        Position = UDim2.new(0, 10, 1, -4), BackgroundColor3 = UI.accent,
+        BorderSizePixel = 0, Visible = false}, tab)
+    H.corner(underline, 2)
+    local scroll = H.make("ScrollingFrame", {Name = key .. "Controls", Visible = false,
+        BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.fromOffset(0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3,
+        ScrollBarImageColor3 = Color3.fromRGB(83, 116, 131),
+        ScrollingDirection = Enum.ScrollingDirection.Y}, S.ui.panel)
+    H.make("UIPadding", {PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 9),
+        PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 14)}, scroll)
+    H.make("UIListLayout", {Padding = UDim.new(0, 7),
+        SortOrder = Enum.SortOrder.LayoutOrder}, scroll)
+    S.ui.pages[key] = {button = tab, scroll = scroll, accent = underline, description = description}
+    H.connect(tab.Activated, function() H.openUITab(key) end)
+end
+S.ui.sectionCaption = H.make("TextLabel", {BackgroundTransparency = 1,
+    Text = "Physics, hazards and recovery", TextColor3 = UI.muted,
+    TextSize = 10, Font = Enum.Font.GothamMedium, Visible = false}, S.ui.panel)
+S.ui.footer = H.make("Frame", {Name = "StatusFooter", BackgroundColor3 = Color3.fromRGB(21, 30, 42),
+    BorderSizePixel = 0}, S.ui.panel)
+H.make("Frame", {Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = UI.border,
+    BorderSizePixel = 0}, S.ui.footer)
+H.make("Frame", {Position = UDim2.fromOffset(14, 23), Size = UDim2.fromOffset(8, 8),
+    BorderSizePixel = 0, BackgroundColor3 = UI.accent}, S.ui.footer)
+S.ui.status = H.make("TextLabel", {Size = UDim2.new(1, -49, 1, -8), Position = UDim2.fromOffset(31, 4),
+    BackgroundTransparency = 1, Text = "Client protection tools ready",
+    TextColor3 = Color3.fromRGB(183, 203, 222), TextSize = 10,
+    TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Center,
+    Font = Enum.Font.GothamMedium, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.footer)
+
+H.useUITab("defense")
+H.section("Defense systems", "Stay aware of local physical threats")
 H.toggleRow("lock", "Anti Exploiter / Position Lock")
 H.toggleRow("fling", "Anti-Fling / Ragdoll Recovery")
 H.toggleRow("monster", "Anti-Monster / Hostile AI Skywalk")
 H.toggleRow("trap", "Anti Trap (seat / stun recovery)")
 H.toggleRow("fall", "Fall Speed Limit")
 H.toggleRow("health", "Health Regeneration (local)")
+H.useUITab("move")
+H.section("Movement", "Flight, speed, jump and idle positioning")
 H.toggleRow("noclip", "Noclip")
 H.toggleRow("flight", "Flight (double-tap jump)")
 H.toggleRow("run", "Run Speed Override")
@@ -4335,13 +4491,17 @@ H.toggleRow("jump", "Custom Jump")
 H.numericRow("Jump Power (0-200)", "jumpPower", Config.MinJumpPower, Config.MaxJumpPower, function()
     if S.flags.jump then H.applyCustomJump() end
 end)
+H.toggleRow("afk", "AFK Streak")
+H.useUITab("combat")
+H.section("Targeting", "Combat helpers and weapon integrations")
 H.toggleRow("aim", "Auto Aim (hostile NPCs + enemy players)")
 H.toggleRow("bullet", "Bullet Aim (compatible guns)")
 S.bulletRange = Config.BulletRange
 H.numericRow("Bullet Range (100-5000)", "bulletRange", 100, 5000, function()
     Config.BulletRange = S.bulletRange
 end)
-H.toggleRow("afk", "AFK Streak")
+H.useUITab("watch")
+H.section("Threat watch", "Observe behavior, collect local evidence")
 H.toggleRow("watch", "Watch Unusual Player Movement")
 S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
 S.ui.watchSummary = H.make("TextLabel", {
@@ -4376,6 +4536,8 @@ S.ui.reportText = H.make("TextBox", {
 }, S.ui.scroll)
 H.corner(S.ui.reportText, 7)
 
+H.useUITab("tools")
+H.section("Position tools", "Save, return and restore controls")
 H.button("TP to Entry Spawn", function()
     if not H.ready() then H.notice("Wait for a living character", 3); return end
     local spawn = H.findJoinSpawn()
@@ -4407,6 +4569,8 @@ H.button("Disable All / Restore Character", function()
     H.notice("All panel features disabled", 3)
 end, Color3.fromRGB(113, 64, 62))
 
+H.openUITab("defense")
+
 local shutdownEvent = H.make("BindableEvent", {Name = "GR33D_Shutdown"}, S.ui.gui)
 S.weaponHooks.query = H.make("BindableFunction", {Name = "GR33D_GetShotAim"}, S.ui.gui)
 S.weaponHooks.query.OnInvoke = H.getShotAim
@@ -4431,9 +4595,11 @@ end)
 function H.beginDrag(input)
     if S.dragging then return end
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        S.ui.dockedRight = false
         S.dragging = {input = input, start = input.Position, position = S.ui.panel.Position, moved = false}
     end
 end
+H.connect(S.ui.header.InputBegan, H.beginDrag)
 H.connect(S.ui.title.InputBegan, H.beginDrag)
 H.connect(S.ui.minimize.InputBegan, function(input) if S.minimized then H.beginDrag(input) end end)
 H.connect(UserInputService.InputChanged, function(input)
@@ -4715,4 +4881,4 @@ H.connect(RunService.Heartbeat, function(deltaTime)
 end)
 
 H.updateSwitches()
-print("[GR33D v7.21] Client threat fingerprinting, defensive watch, smart shield sensing, and report loaded.")
+print("[GR33D v7.22] Client threat fingerprinting, defensive watch, smart shield sensing, and report loaded.")
