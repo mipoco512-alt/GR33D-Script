@@ -1,4 +1,4 @@
--- GR33D Panel v7.20: rapid lethal-projectile dodge; external TP permission removed
+-- GR33D Panel v7.21: adaptive client defense, movement watch, Smart Shield sensing and logs
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -42,6 +42,23 @@ local Config = {
     LockLocalScanRadius = 125,
     LockLocalScanMaxParts = 160,
     LockMaintenanceInterval = 0.12, -- refreshing every limb every frame caused unnecessary work
+    -- Smart Shield is a proximity *sensor*, not another collidable physics body.
+    ShieldSenseInterval = 0.10,
+    ShieldSenseRadius = 38,
+    ShieldSenseMaxParts = 75,
+    ShieldSenseMinApproachSpeed = 30,
+    ShieldSenseImpactWindow = 0.65,
+    -- Movement monitoring is opt-in, observational and never attacks players.
+    ObserverInterval = 0.22,
+    ObserverTeleportDistance = 85,
+    ObserverTeleportSpeed = 260,
+    ObserverFastSpeed = 115,
+    ObserverEvidenceCooldown = 0.8,
+    ObserverAlertScore = 5,
+    ObserverScoreDecayPerSecond = 0.20,
+    ObserverMaxRecords = 35,
+    DefenseLogLimit = 90,
+    ThreatFingerprintLimit = 100,
     AFKHoldPositionTolerance = 0.14,
     UseHazardNameHints = true, -- only moving, on-course projectiles; names alone never cause a dodge
     UseNPCNameHints = true,
@@ -181,9 +198,13 @@ local S = {
     lastChaseRelocate = -math.huge, lastChaseThreatAt = -math.huge,
     impactEntries = {}, recentHazard = nil,
     minimized = false, dragging = nil, suppressMinimizeUntil = -math.huge,
+    defenseLog = {}, defenseMode = "normal", threatSignatures = {},
+    shieldSenseAt = -math.huge, shieldSenseOverlap = nil,
+    observers = {}, observerClock = 0, observingPlayer = nil, observingOriginalSubject = nil,
+    observingOriginalType = nil, observerSummary = nil, lastReportRefresh = -math.huge,
 }
 local H = {}
-for _, key in ipairs({"flight", "health", "fall", "noclip", "fling", "trap", "run", "jump", "lock", "monster", "afk", "aim", "bullet"}) do
+for _, key in ipairs({"flight", "health", "fall", "noclip", "fling", "trap", "run", "jump", "lock", "monster", "afk", "aim", "bullet", "watch"}) do
     S.flags[key] = false
 end
 
@@ -212,6 +233,33 @@ end
 function H.notice(message, duration)
     S.notice = message
     S.noticeUntil = os.clock() + (duration or 3)
+end
+
+-- In-memory recorder; no uploads, no automated player reports or punitive actions.
+function H.logEvent(kind, detail)
+    if not S.alive then return end
+    local entry = {at = os.clock(), kind = tostring(kind), detail = tostring(detail or "")}
+    local events = S.defenseLog
+    events[#events + 1] = entry
+    if #events > Config.DefenseLogLimit then table.remove(events, 1) end
+end
+
+function H.defenseState()
+    -- Priority order prevents simultaneous controllers from claiming the same rig.
+    if S.escape then return S.escape.mode == "emergency" and "emergency-escape" or "escape" end
+    if S.flags.lock then return "position-lock" end
+    if S.hovering then return "skywalk" end
+    if S.flying then return "flight" end
+    if S.flags.afk and S.idleTarget then return "afk-hold" end
+    return "normal"
+end
+
+function H.updateDefenseState()
+    local mode = H.defenseState()
+    if mode ~= S.defenseMode then
+        S.defenseMode = mode
+        H.logEvent("Controller", "Active mode: " .. mode)
+    end
 end
 
 function H.report(label, message)
@@ -699,7 +747,10 @@ function H.hazardSnapshot()
         else
             local ok, info = pcall(H.hazardInfo, instance)
             if ok then
-                if info then table.insert(records, info) end
+                if info then
+                    table.insert(records, info)
+                    H.fingerprintThreat(info)
+                end
                 S.hazardErrors[instance] = nil
             elseif now - (S.hazardErrors[instance] or -math.huge) >= 5 then
                 S.hazardErrors[instance] = now
@@ -709,6 +760,47 @@ function H.hazardSnapshot()
     end
     S.hazardCache, S.hazardCacheAt = records, now
     return records
+end
+
+-- Fingerprints explain suspicious *objects*, not who owns or manipulated them.
+function H.fingerprintThreat(info)
+    if not S.flags.lock or not info or not info.instance then return end
+    local now = os.clock()
+    local old = S.threatSignatures[info.instance]
+    local mark = (info.teleported and 3 or 0) + (info.erratic and 2 or 0)
+        + (info.grabbed and 2 or 0) + (info.spinning and 1 or 0)
+        + (info.velocity.Magnitude >= Config.UrgentExtremeSpeed and 2 or 0)
+    if mark <= 0 then return end
+    if not old then
+        old = {score = 0, count = 0, lastAt = -math.huge, updatedAt = now}
+        S.threatSignatures[info.instance] = old
+    end
+    old.updatedAt = now
+    if now - old.lastAt >= 0.7 then
+        old.count += 1
+        old.score = math.min(20, old.score + mark)
+        old.lastAt = now
+        if old.count >= 2 and old.score >= 5 then
+            H.logEvent("Threat", ("Repeated abnormal %s (score %d)"):format(info.name, old.score))
+        end
+    end
+end
+
+function H.cleanFingerprints()
+    if not S.flags.lock then S.threatSignatures = {}; return end
+    local now, items = os.clock(), {}
+    for obj, entry in pairs(S.threatSignatures) do
+        if not obj.Parent or now - entry.updatedAt > 7 then
+            S.threatSignatures[obj] = nil
+        else
+            items[#items + 1] = {object = obj, at = entry.updatedAt}
+        end
+    end
+    if #items <= Config.ThreatFingerprintLimit then return end
+    table.sort(items, function(a, b) return a.at < b.at end)
+    for index = 1, #items - Config.ThreatFingerprintLimit do
+        S.threatSignatures[items[index].object] = nil
+    end
 end
 
 function H.findHazard(position, observerVelocity, includeSweep)
@@ -1230,6 +1322,7 @@ function H.urgentImpactEscape(threat)
                 S.urgentLastMove = now
                 S.lastEmergency, S.lastEscape, S.lastChaseRelocate = now, now, now
                 S.escape.pursuer, S.escape.lastThreatAt = threat.instance, now
+                H.logEvent("Urgent dodge", "Fast approaching " .. tostring(threat.name))
                 H.notice("URGENT DODGE: rapid hazardous object", 2)
                 return true
             end
@@ -1323,6 +1416,57 @@ function H.urgentImpactProbe()
     return false
 end
 
+-- Smart Shield 2.0: lightweight non-collidable proximity detection. It never
+-- anchors/changes the shield and only asks existing dodge routines to move.
+function H.smartShieldScan()
+    if not S.flags.lock or not H.ready() or S.escape then return false end
+    local now = os.clock()
+    if now - S.shieldSenseAt < Config.ShieldSenseInterval then return false end
+    S.shieldSenseAt = now
+    if now < S.manualTeleportUntil then return false end
+    local overlap = S.shieldSenseOverlap
+    if not overlap then
+        overlap = OverlapParams.new()
+        overlap.FilterType = Enum.RaycastFilterType.Exclude
+        overlap.MaxParts = Config.ShieldSenseMaxParts
+        S.shieldSenseOverlap = overlap
+    end
+    overlap.FilterDescendantsInstances = {S.context.character}
+    local pos = S.context.root.Position
+    local parts = Workspace:GetPartBoundsInRadius(pos, Config.ShieldSenseRadius, overlap)
+    local best, bestTime
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") then
+            local velocity = part.AssemblyLinearVelocity
+            if H.finiteVector(velocity)
+                and velocity.Magnitude >= Config.ShieldSenseMinApproachSpeed
+                and H.hazardCandidate(part) then
+                local delta = pos - part.Position
+                local approach = delta:Dot(velocity) / math.max(1, velocity:Dot(velocity))
+                local closest = part.Position + velocity * math.max(0, approach)
+                local pad = math.min(20, part.Size.Magnitude * 0.5) + Config.HazardMargin + 3
+                local likely = approach >= 0 and approach <= Config.ShieldSenseImpactWindow
+                    and (pos - closest).Magnitude <= pad
+                if likely then
+                local info = H.hazardInfo(part)
+                if info then
+                    local danger, _, impact = H.threatAt(info, pos, Vector3.zero, true)
+                    if danger and impact <= Config.ShieldSenseImpactWindow
+                        and (not bestTime or impact < bestTime) then
+                        best, bestTime = info, impact
+                    end
+                end
+                end -- likely projected approach
+            end
+        end
+    end
+    if best then
+        H.logEvent("Smart Shield", "Early predicted contact: " .. tostring(best.name))
+        return H.escape(best, "shield forecast " .. tostring(best.name))
+    end
+    return false
+end
+
 -- Repeated pursuit widens the search, changes its angle and checks every
 -- destination against the entire sampled hazard set.
 function H.emergencyEscape(reason, pursuit)
@@ -1386,6 +1530,7 @@ function H.emergencyEscape(reason, pursuit)
         S.escape.lastThreatAt = now
         S.escape.earliestReturn = now + Config.EmergencyMinDuration
         S.lastEmergency, S.lastEscape, S.lastChaseRelocate = now, now, now
+        H.logEvent("Emergency escape", tostring(reason) .. " | relocations=" .. tostring(count))
         H.notice(already and "EMERGENCY: changed direction to evade pursuit"
             or "EMERGENCY: moved to a clear escape position", 3)
         return true
@@ -1508,6 +1653,7 @@ function H.escape(hazard, reason)
         S.escape.chaseCount, S.escape.pursuer = count, hazard.instance
         S.escape.lastThreatAt = os.clock()
         S.lastEscape, S.lastChaseRelocate = os.clock(), os.clock()
+        H.logEvent("Dodge", tostring(reason))
         H.notice("Dodged " .. tostring(reason) .. "; tracking pursuit", 3)
         return true
     end
@@ -1742,6 +1888,7 @@ function H.stopLock(tryLanding)
     S.lockTarget, S.escape = nil, nil
     H.destroyShield()
     H.release("lock")
+    S.threatSignatures, S.shieldSenseOverlap = {}, nil
 end
 
 local BODY_PART_NAMES = {
@@ -2505,6 +2652,7 @@ function H.flingRestore(reason, fallback)
         end
         if now - S.lastFlingRecovery >= 1 then
             S.lastFlingRecovery = now
+            H.logEvent("Anti-fling", tostring(reason) .. " | local recovery attempted")
             H.notice("Anti-Fling: " .. tostring(reason) .. " corrected locally", 2)
         end
     end)
@@ -2837,6 +2985,7 @@ function H.teleport(target, label)
         return false
     end
     S.safeRoot, S.safeTime = chosen, os.clock()
+    H.logEvent("Own teleport", "Built-in TP to " .. tostring(label or "destination"))
     H.notice("TP to " .. tostring(label or "destination") .. " requested", 3)
     local ctx = S.context
     task.delay(0.75, function()
@@ -3310,7 +3459,8 @@ function H.pickAimTarget(origin, camera)
 end
 
 function H.updateAim(deltaTime)
-    if not S.flags.aim or not H.ready() or UserInputService:GetFocusedTextBox() then
+    if not S.flags.aim or not H.ready() or S.observingPlayer
+        or UserInputService:GetFocusedTextBox() then
         S.aimTarget = nil
         return
     end
@@ -3605,9 +3755,164 @@ end
 function H.primeHazardIndex()
     S.urgentLastScan, S.urgentLastMove = -math.huge, -math.huge
     S.urgentOverlap = nil
+    S.shieldSenseAt, S.shieldSenseOverlap = -math.huge, nil
+    S.threatSignatures = {}
     S.hazardCache, S.lastProtectionScanAt = nil, -math.huge
     S.lockOverlap, S.lockLocalScanAt = nil, -math.huge
     H.sampleNearbyHazards(true)
+end
+
+-- Suspicious-player observer: movement-only heuristics. Never interprets
+-- speed as proof of cheating; disasters, abilities and latency can look similar.
+function H.observerReason(root, humanoid, previous, position, now)
+    local elapsed = now - previous.at
+    if elapsed < 0.1 or elapsed > 1.4 then return nil end
+    if humanoid.Health <= 0 or humanoid.Sit or humanoid.SeatPart then return nil end
+    local displacement = position - previous.position
+    local distance = displacement.Magnitude
+    local sampleSpeed = distance / elapsed
+    local normal = math.max(16, humanoid.WalkSpeed)
+    if distance >= Config.ObserverTeleportDistance
+        and sampleSpeed >= Config.ObserverTeleportSpeed then
+        return "large position jump", sampleSpeed, 3
+    end
+    if sampleSpeed >= math.max(Config.ObserverFastSpeed, normal * 3.8) then
+        return "unusually fast movement", sampleSpeed, 2
+    end
+    -- Air time on its own is not evidence of exploiting.
+    if previous.airSince and now - previous.airSince > 3.5
+        and humanoid.FloorMaterial == Enum.Material.Air
+        and math.abs(displacement.Y / elapsed) < 2
+        and Vector3.new(displacement.X, 0, displacement.Z).Magnitude / elapsed > 65 then
+        return "sustained rapid airborne travel", sampleSpeed, 1
+    end
+    return nil
+end
+
+function H.samplePlayers(deltaTime)
+    if not S.flags.watch or not S.alive then return end
+    S.observerClock += deltaTime
+    if S.observerClock < Config.ObserverInterval then return end
+    local dt = S.observerClock
+    S.observerClock = 0
+    local now = os.clock()
+    local active = {}
+    local best, bestScore
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other ~= player then
+            active[other] = true
+            local character = other.Character
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            local hum = character and character:FindFirstChildOfClass("Humanoid")
+            local old = S.observers[other]
+            if root and hum and hum.Health > 0 then
+                local rec = old or {score = 0, streak = 0, lastEvent = -math.huge}
+                local position = root.Position
+                rec.score = math.max(0, rec.score - dt * Config.ObserverScoreDecayPerSecond)
+                local reason, speed, points
+                if old and old.root == root and old.position then
+                    reason, speed, points = H.observerReason(root, hum, old, position, now)
+                end
+                if reason and now - rec.lastEvent > Config.ObserverEvidenceCooldown then
+                    rec.score = math.min(25, rec.score + points)
+                    rec.streak += 1
+                    rec.lastEvent = now
+                    rec.reason = reason
+                    rec.lastSpeed = speed
+                    if rec.streak >= 2 then
+                        H.logEvent("Movement watch", ("%s: %s (%.0f studs/s); score %.1f")
+                            :format(other.Name, reason, speed, rec.score))
+                    end
+                elseif not reason and old and now - (old.lastEvent or -math.huge) > 6 then
+                    rec.streak = math.max(0, rec.streak - 1)
+                end
+                rec.airSince = (hum.FloorMaterial == Enum.Material.Air)
+                    and (old and old.airSince or now) or nil
+                rec.position, rec.at, rec.root = position, now, root
+                S.observers[other] = rec
+                if rec.streak >= 2 and rec.score >= Config.ObserverAlertScore
+                    and (not bestScore or rec.score > bestScore) then
+                    best, bestScore = other, rec.score
+                end
+            else
+                -- Never treat despawn/streaming transitions as teleports.
+                S.observers[other] = nil
+            end
+        end
+    end
+    for other in pairs(S.observers) do
+        if not active[other] then S.observers[other] = nil end
+    end
+    S.observerSummary = best and (("Unusual movement: %s (score %.1f)"):format(best.Name, bestScore))
+        or "No repeated movement anomalies"
+end
+
+function H.stopObserving()
+    local camera = Workspace.CurrentCamera
+    if camera and S.observingPlayer then
+        camera.CameraType = S.observingOriginalType or Enum.CameraType.Custom
+        local previous = S.observingOriginalSubject
+        if previous and previous.Parent then camera.CameraSubject = previous
+        elseif S.context and S.context.humanoid.Parent then camera.CameraSubject = S.context.humanoid end
+    end
+    S.observingPlayer, S.observingOriginalSubject, S.observingOriginalType = nil, nil, nil
+end
+
+function H.observeMostSuspicious()
+    if not S.flags.watch then H.notice("Enable Suspicious Movement Watch first", 3); return end
+    local best, score
+    for other, rec in pairs(S.observers) do
+        if rec.streak >= 2 and rec.score >= Config.ObserverAlertScore
+            and (not score or rec.score > score) then
+            best, score = other, rec.score
+        end
+    end
+    if not best then H.notice("No repeatedly unusual player movement detected", 4); return end
+    local camera = Workspace.CurrentCamera
+    local humanoid = best.Character and best.Character:FindFirstChildOfClass("Humanoid")
+    if not camera or not humanoid then H.notice("Player not visible or not spawned", 3); return end
+    H.stopObserving()
+    S.observingOriginalSubject, S.observingOriginalType = camera.CameraSubject, camera.CameraType
+    S.observingPlayer = best
+    camera.CameraType = Enum.CameraType.Custom
+    camera.CameraSubject = humanoid
+    H.logEvent("Camera follow", "Observing " .. best.Name .. " (unverified movement)")
+    H.notice("Camera following " .. best.Name .. "; character stays in place", 4)
+end
+
+function H.maintainObserverCamera()
+    local observed = S.observingPlayer
+    if not observed then return end
+    local camera = Workspace.CurrentCamera
+    local humanoid = observed.Character and observed.Character:FindFirstChildOfClass("Humanoid")
+    if not camera or not observed.Parent then H.stopObserving(); return end
+    if not humanoid or humanoid.Health <= 0 then H.stopObserving(); return end
+    if camera.CameraSubject ~= humanoid then camera.CameraSubject = humanoid end
+end
+
+function H.defenseReport()
+    local out = {"GR33D v7.21 | Client-only defense diagnostics",
+        "Reports indicate observed events, not verified exploit use or server acceptance.",
+        "Current mode: " .. H.defenseState(),
+        "", "-- Observed player movement --"}
+    local entries = {}
+    for other, rec in pairs(S.observers) do
+        entries[#entries + 1] = {name = other.Name, score = rec.score,
+            reason = rec.reason or "none", streak = rec.streak}
+    end
+    table.sort(entries, function(a,b) return a.score > b.score end)
+    for index = 1, math.min(15, #entries) do
+        local entry = entries[index]
+        out[#out + 1] = ("%s: score %.1f, repeats %d, last %s")
+            :format(entry.name, entry.score, entry.streak, entry.reason)
+    end
+    out[#out + 1] = ""
+    out[#out + 1] = "-- Recent events --"
+    for index = math.max(1, #S.defenseLog - 49), #S.defenseLog do
+        local entry = S.defenseLog[index]
+        out[#out + 1] = ("[%.1fs] %s: %s"):format(entry.at, entry.kind, entry.detail)
+    end
+    return table.concat(out, "\n")
 end
 
 function H.setToggle(key, enabled)
@@ -3693,6 +3998,14 @@ function H.setToggle(key, enabled)
                 H.primeEnemyIndex()
                 H.notice("Bullet Aim ready for compatible guns; awaiting projectile or shot integration", 5)
             else H.stopBulletAim() end
+        elseif key == "watch" then
+            S.observerClock = 0
+            if not enabled then
+                H.stopObserving()
+                S.observers, S.observerSummary = {}, nil
+            else
+                H.notice("Movement watch is observational; high speed is not proof", 4)
+            end
         elseif key == "fall" and enabled then
             H.notice("Descent limited; game-defined fall damage may still apply", 4)
         end
@@ -3829,6 +4142,7 @@ function H.beginCharacter(character)
                 -- The event fires as soon as Roblox reports the HP change; no
                 -- periodic scan or nearby-hazard match is required to respond.
                 S.lastDamageAt = now
+                H.logEvent("Health", ("HP dropped %.2f to %.2f"):format(loss, health))
                 for i = #S.damageEvents, 1, -1 do
                     if now - S.damageEvents[i] > Config.DamageBurstWindow then
                         table.remove(S.damageEvents, i)
@@ -3870,6 +4184,7 @@ function H.shutdown(destroyGui)
         local ok, message = pcall(H.endHover, true)
         if not ok then H.report("Shutdown skywalk landing", message) end
     end
+    H.stopObserving()
     S.alive = false
     H.disconnectAll(S.connections)
     if S.cameraConnection then S.cameraConnection:Disconnect(); S.cameraConnection = nil end
@@ -3987,7 +4302,7 @@ S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true, BackgroundColor
 H.corner(S.ui.panel, 12)
 H.make("UIStroke", {Thickness = 1, Color = Color3.fromRGB(61, 72, 95)}, S.ui.panel)
 S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -82, 0, 43), Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1, Text = "GR33D  v7.19", TextColor3 = Color3.fromRGB(234, 240, 250),
+    BackgroundTransparency = 1, Text = "GR33D  v7.21", TextColor3 = Color3.fromRGB(234, 240, 250),
     TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
 S.ui.minimize = H.make("TextButton", {Text = "-", BackgroundColor3 = Color3.fromRGB(37, 43, 57),
     TextColor3 = Color3.fromRGB(234, 240, 250), TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
@@ -4027,6 +4342,39 @@ H.numericRow("Bullet Range (100-5000)", "bulletRange", 100, 5000, function()
     Config.BulletRange = S.bulletRange
 end)
 H.toggleRow("afk", "AFK Streak")
+H.toggleRow("watch", "Watch Unusual Player Movement")
+S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
+S.ui.watchSummary = H.make("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 32), LayoutOrder = S.ui.nextOrder,
+    BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(194, 205, 224),
+    Text = "Monitor is off", TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+    TextSize = 11, Font = Enum.Font.Gotham,
+}, S.ui.scroll)
+H.button("Camera Follow Most Suspicious (Observe)", H.observeMostSuspicious,
+    Color3.fromRGB(49, 84, 114))
+H.button("Stop Observing / Return My Camera", function()
+    H.stopObserving()
+    H.notice("Camera returned to your character", 3)
+end, Color3.fromRGB(59, 89, 84))
+S.ui.watchStatus = H.button("Show Suspicion / Defense Report", function()
+    if not S.ui.reportText then return end
+    S.ui.reportText.Visible = not S.ui.reportText.Visible
+    if S.ui.reportText.Visible then
+        S.ui.reportText.Text = H.defenseReport()
+        H.notice("Select report text to copy; no data sent anywhere", 4)
+    end
+end, Color3.fromRGB(90, 68, 119))
+S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
+S.ui.reportText = H.make("TextBox", {
+    Size = UDim2.new(1, 0, 0, 220), LayoutOrder = S.ui.nextOrder,
+    BackgroundColor3 = Color3.fromRGB(28, 32, 43),
+    TextColor3 = Color3.fromRGB(218, 226, 239),
+    Text = "", TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextSize = 11, Font = Enum.Font.Code, ClearTextOnFocus = false,
+    MultiLine = true, TextWrapped = true, TextEditable = false, Visible = false,
+}, S.ui.scroll)
+H.corner(S.ui.reportText, 7)
 
 H.button("TP to Entry Spawn", function()
     if not H.ready() then H.notice("Wait for a living character", 3); return end
@@ -4052,7 +4400,7 @@ H.button("TP to Saved Map Location", function()
 end, Color3.fromRGB(43, 121, 91))
 
 H.button("Disable All / Restore Character", function()
-    for _, key in ipairs({"lock", "monster", "flight", "noclip", "fling", "trap", "run", "jump", "aim", "bullet", "afk", "health", "fall"}) do
+    for _, key in ipairs({"lock", "monster", "flight", "noclip", "fling", "trap", "run", "jump", "aim", "bullet", "afk", "health", "fall", "watch"}) do
         H.setToggle(key, false)
     end
     H.releaseAll()
@@ -4114,7 +4462,11 @@ function H.bindCamera()
     if camera then S.cameraConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(H.layout) end
     H.layout()
 end
-H.connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), H.bindCamera)
+H.connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), function()
+    H.bindCamera()
+    -- A replaced camera cannot be assumed to retain the original spectator state.
+    if S.observingPlayer then H.stopObserving() end
+end)
 H.bindCamera()
 
 task.spawn(function()
@@ -4204,6 +4556,10 @@ for _, tags in ipairs({Config.HazardTags, Config.HostileTags,
 end
 -- IMPORTANT: no Workspace:GetDescendants() at startup; indexes start empty.
 
+H.connect(Players.PlayerRemoving, function(other)
+    S.observers[other] = nil
+    if S.observingPlayer == other then H.stopObserving() end
+end)
 H.connect(player.CharacterAdded, H.beginCharacter)
 H.connect(player.CharacterRemoving, function(character)
     if S.context and S.context.character == character then
@@ -4226,6 +4582,7 @@ function H.physicsTick(deltaTime)
         -- Check extreme, incoming hazards between regular position-lock scans.
         -- A successful urgent dodge is already in S.escape; keep its hold.
         H.urgentImpactProbe()
+        H.smartShieldScan()
         H.updateEscape()
         if S.escape then H.updateEscapeHold() else H.applyLock() end
         return
@@ -4276,6 +4633,19 @@ end)
 
 H.connect(RunService.Heartbeat, function(deltaTime)
     if not S.alive then return end
+    H.updateDefenseState()
+    if S.ui.watchSummary and S.ui.watchSummary.Parent then
+        S.ui.watchSummary.Text = S.flags.watch
+            and (S.observingPlayer and ("Camera: " .. S.observingPlayer.Name .. " | "
+                .. (S.observerSummary or "monitoring"))
+                or (S.observerSummary or "Sampling players for repeated unusual movement"))
+            or "Movement monitoring disabled (no extra player scanning)"
+    end
+    if S.flags.watch then
+        local watchOK, watchMessage = pcall(H.samplePlayers, deltaTime)
+        if not watchOK then H.report("Movement watch", watchMessage); S.flags.watch = false; H.updateSwitches() end
+        if S.observingPlayer then H.maintainObserverCamera() end
+    end
     local healthOK, healthMessage = pcall(H.updateHealthRecovery, deltaTime)
     if not healthOK then
         S.flags.health = false
@@ -4295,6 +4665,10 @@ H.connect(RunService.Heartbeat, function(deltaTime)
     S.scanClock = S.scanClock + deltaTime
     if S.scanClock < Config.ScanInterval then return end
     S.scanClock = 0
+    if S.flags.lock and (not S.lastFingerprintCleanup or os.clock() - S.lastFingerprintCleanup >= 3) then
+        S.lastFingerprintCleanup = os.clock()
+        H.cleanFingerprints()
+    end
     if H.ready() then
         local ok, message = pcall(function()
             H.updateEscape()
@@ -4329,6 +4703,8 @@ H.connect(RunService.Heartbeat, function(deltaTime)
             for _ in pairs(S.guidedBullets) do count = count + 1 end
             S.ui.status.Text = count > 0 and ("Bullet Aim: guiding " .. tostring(count) .. " projectiles") or "Bullet Aim: awaiting compatible gun shots"
         elseif S.flags.monster then S.ui.status.Text = "Anti-Monster armed: scanning hostile AI and worms"
+        elseif S.observingPlayer then S.ui.status.Text = "Camera observing " .. S.observingPlayer.Name
+        elseif S.flags.watch then S.ui.status.Text = S.observerSummary or "Watching for repeated unusual movement"
         elseif S.runBackoffUntil and os.clock() < S.runBackoffUntil then S.ui.status.Text = "Run override paused after repeated position corrections"
         elseif S.flags.health then S.ui.status.Text = S.healthStatus or "Health regeneration enabled (local)"
         elseif S.flags.afk and S.afkPulseUntil then S.ui.status.Text = "AFK Streak: activity pulse"
@@ -4339,4 +4715,4 @@ H.connect(RunService.Heartbeat, function(deltaTime)
 end)
 
 H.updateSwitches()
-print("[GR33D v7.19] Local lock scanning, enemy-only PvP aim and steadier AFK hold/pulse loaded.")
+print("[GR33D v7.21] Client threat fingerprinting, defensive watch, smart shield sensing, and report loaded.")
