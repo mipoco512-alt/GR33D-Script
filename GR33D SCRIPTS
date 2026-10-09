@@ -93,10 +93,10 @@ local Config = {
     NPCLiftHeight = 15,
     NPCClearanceHeight = 3,
     NPCLiftCooldown = 0.35,
-    NPCMinHoverDuration = 0.45,
-    NPCQuietTime = 0.35,
+    NPCMinHoverDuration = 0.20, -- leave skywalk sooner once landing is safe
+    NPCQuietTime = 0.12, -- shorten safe-clear delay; retain safe landing checks
     NPCScanRadius = 42,
-    NPCScanInterval = 0.12,
+    NPCScanInterval = 0.08, -- slightly faster proximity updates only while enabled
     NPCMaxLocalParts = 200,
     NPCLandingDepth = 750,
     AimRange = 600,
@@ -1771,9 +1771,124 @@ function H.noclip(owner, enabled)
     end
 end
 
+-- Anti Trap only changes CanTouch on character body parts.
+-- Never modify CanCollide or CanQuery: walls, floors and normal raycasts remain intact.
+-- Seats rely on touch events, so temporarily restore CanTouch when seated
+-- or while approaching a Seat/VehicleSeat.
+function H.releaseTrapProperty(instance, property)
+    local fields = S.properties[instance]
+    local entry = fields and fields[property]
+    if not entry or not entry.owners.trap then return end
+    entry.owners.trap = nil
+    if next(entry.owners) == nil then
+        local ok, message = pcall(function() instance[property] = entry.original end)
+        if not ok and instance.Parent then H.report("Anti Trap restore " .. property, message) end
+        fields[property] = nil
+    end
+    if next(fields) == nil then S.properties[instance] = nil end
+end
+
+function H.releaseAntiTrap()
+    -- Restore the original CanTouch without touching CanCollide or CanQuery.
+    local instances = {}
+    for instance in pairs(S.properties) do table.insert(instances, instance) end
+    for _, instance in ipairs(instances) do
+        H.releaseTrapProperty(instance, "CanTouch")
+    end
+    S.trapSeatSuspended = false
+end
+
+function H.trapNearSeat(ctx)
+    local humanoid = ctx.humanoid
+    if humanoid.Sit or humanoid.SeatPart ~= nil
+        or humanoid:GetState() == Enum.HumanoidStateType.Seated then return true end
+    local now = os.clock()
+    if now - (S.trapSeatScanAt or -math.huge) < 0.12 then
+        return S.trapSeatNearby == true
+    end
+    S.trapSeatScanAt = now
+    local params = S.trapSeatParams
+    if not params then
+        params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        S.trapSeatParams = params
+    end
+    params.FilterDescendantsInstances = {ctx.character}
+    local ok, nearby = pcall(function()
+        return Workspace:GetPartBoundsInRadius(ctx.root.Position, 6, params)
+    end)
+    S.trapSeatNearby = false
+    if ok then
+        for _, part in ipairs(nearby) do
+            if part:IsA("Seat") or part:IsA("VehicleSeat") then
+                S.trapSeatNearby = true
+                break
+            end
+        end
+    end
+    return S.trapSeatNearby
+end
+
+function H.applyAntiTrap()
+    if not S.flags.trap or not H.ready() then return end
+    local ctx = S.context
+    if H.trapNearSeat(ctx) then
+        if not S.trapSeatSuspended then H.releaseAntiTrap() end
+        S.trapSeatSuspended = true
+        return
+    end
+    S.trapSeatSuspended = false
+    for part in pairs(ctx.parts) do
+        if part.Parent == ctx.character and part:IsA("BasePart")
+            and BODY_PART_NAMES[part.Name] then
+            H.claim(part, "CanTouch", false, "trap")
+        end
+    end
+end
+
+-- Skywalk only: manually play the character's own walk animation, because
+-- PlatformStand used by hover blocks normal humanoid walking animation updates.
+function H.startSkywalkWalk()
+    if not S.hovering or not S.mover or not H.ready() then return end
+    local ctx, mover = S.context, S.mover
+    local animate = ctx.character:FindFirstChild("Animate")
+    local walkFolder = animate and animate:FindFirstChild("walk")
+    local template = walkFolder and walkFolder:FindFirstChildWhichIsA("Animation")
+    if not template then
+        local runFolder = animate and animate:FindFirstChild("run")
+        template = runFolder and runFolder:FindFirstChildWhichIsA("Animation")
+    end
+    local anim = Instance.new("Animation")
+    anim.Name = "GR33D_SkywalkWalk"
+    anim.AnimationId = template and template.AnimationId ~= "" and template.AnimationId
+        or (ctx.humanoid.RigType == Enum.HumanoidRigType.R15
+            and "rbxassetid://507777826" or "rbxassetid://180426354")
+    local ok, track = pcall(function()
+        local animator = ctx.humanoid:FindFirstChildOfClass("Animator")
+        if not animator then
+            animator = Instance.new("Animator")
+            animator.Parent = ctx.humanoid
+        end
+        return animator:LoadAnimation(anim)
+    end)
+    if not ok or not track then
+        anim:Destroy()
+        H.report("Skywalk walk animation", track)
+        return
+    end
+    track.Priority = Enum.AnimationPriority.Action
+    track.Looped = true
+    mover.walkAnimation, mover.walkTrack = anim, track
+end
+
 function H.stopMover()
     local wasHovering = S.hovering
     if S.mover then
+        if S.mover.walkTrack then
+            pcall(function() S.mover.walkTrack:Stop(0.12) end)
+            S.mover.walkTrack:Destroy()
+        end
+        if S.mover.walkAnimation then S.mover.walkAnimation:Destroy() end
         S.mover.velocity:Destroy()
         if S.mover.heightHold then S.mover.heightHold:Destroy() end
         if S.mover.orientation then S.mover.orientation:Destroy() end
@@ -1858,6 +1973,7 @@ function H.startMover(kind, target)
         S.hoverY, S.hoverStartedAt = target.Position.Y, os.clock()
         if not H.moveRoot(target) then H.stopMover(); return false end
         H.zeroRigVelocity()
+        H.startSkywalkWalk()
     else
         ctx.humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
     end
@@ -2130,6 +2246,16 @@ function H.updateMover()
         end
         local flat = direction.Magnitude > 1 and direction.Unit or direction
         direction = Vector3.new(flat.X * speed, 0, flat.Z * speed)
+        -- Walk-cycle follows actual movement; stop moving = stop the walk cycle.
+        local track = S.mover.walkTrack
+        if track then
+            if flat.Magnitude > 0.08 then
+                if not track.IsPlaying then track:Play(0.12, 1, 1) end
+                track:AdjustSpeed(math.clamp(speed * flat.Magnitude / 16, 0.6, 2.2))
+            elseif track.IsPlaying then
+                track:Stop(0.16)
+            end
+        end
         if S.mover.heightHold then
             S.mover.heightHold.Position = Vector3.new(ctx.root.Position.X, S.hoverY, ctx.root.Position.Z)
         end
@@ -2445,6 +2571,7 @@ end
 
 function H.applyCollision()
     if S.flags.noclip then H.noclip("noclip", true) end
+    if S.flags.trap then H.applyAntiTrap() end
 end
 
 function H.teleport(target, label)
@@ -3168,6 +3295,8 @@ function H.setToggle(key, enabled)
                 H.endHover(true)
                 S.npcOverlap, S.npcNearbyIgnore = nil, {}
             end
+        elseif key == "trap" then
+            if enabled then H.applyAntiTrap() else H.releaseAntiTrap() end
         elseif key == "noclip" then
             if enabled then H.noclip("noclip", true) else H.release("noclip") end
         elseif key == "fling" then
@@ -3218,6 +3347,7 @@ function H.setToggle(key, enabled)
         -- Undo partial activation, not just its visual state.
         if key == "lock" then H.stopLock(false)
         elseif key == "noclip" then H.release("noclip")
+        elseif key == "trap" then H.releaseAntiTrap()
         elseif key == "flight" or key == "monster" then H.stopMover()
         elseif key == "fling" then H.releaseFlingHold(); H.release("fling")
         elseif key == "jump" then H.release("jump")
@@ -3240,7 +3370,7 @@ function H.cleanupCharacter()
     H.disconnectAll(S.characterConnections)
     -- A failure in one cleanup must not skip anchor/property restoration.
     for _, cleanup in ipairs({H.stopAim, H.stopBulletAim, H.resetMovementHealth,
-        function() H.stopLock(false) end, H.stopMover, H.releaseFlingHold, H.releaseAll}) do
+        function() H.stopLock(false) end, H.stopMover, H.releaseAntiTrap, H.releaseFlingHold, H.releaseAll}) do
         local ok, message = pcall(cleanup)
         if not ok then H.report("Character cleanup", message) end
     end
@@ -3499,7 +3629,7 @@ S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true, BackgroundColor
 H.corner(S.ui.panel, 12)
 H.make("UIStroke", {Thickness = 1, Color = Color3.fromRGB(61, 72, 95)}, S.ui.panel)
 S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -82, 0, 43), Position = UDim2.fromOffset(12, 0),
-    BackgroundTransparency = 1, Text = "GR33D  v7.12", TextColor3 = Color3.fromRGB(234, 240, 250),
+    BackgroundTransparency = 1, Text = "GR33D  v7.15", TextColor3 = Color3.fromRGB(234, 240, 250),
     TextSize = 14, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.panel)
 S.ui.minimize = H.make("TextButton", {Text = "-", BackgroundColor3 = Color3.fromRGB(37, 43, 57),
     TextColor3 = Color3.fromRGB(234, 240, 250), TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
@@ -3741,15 +3871,6 @@ function H.physicsTick(deltaTime)
     end
     if S.mover then H.updateMover(); return end
     if ctx.root.Anchored then return end
-    if S.flags.trap then
-        if ctx.humanoid.Sit then ctx.humanoid.Sit = false end
-        if ctx.humanoid.PlatformStand then ctx.humanoid.PlatformStand = false end
-        local state = ctx.humanoid:GetState()
-        if state == Enum.HumanoidStateType.Ragdoll or state == Enum.HumanoidStateType.FallingDown
-            or state == Enum.HumanoidStateType.PlatformStanding then
-            ctx.humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-        end
-    end
     H.updateRun(deltaTime)
     if S.flags.fall and ctx.humanoid.FloorMaterial == Enum.Material.Air then
         local velocity = ctx.root.AssemblyLinearVelocity
