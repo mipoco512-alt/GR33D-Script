@@ -1,4 +1,4 @@
--- GR33D Panel v7.21: adaptive client defense, movement watch, Smart Shield sensing and logs
+-- GR33D Panel v7.23: adaptive client defense, movement watch, Smart Shield sensing and logs
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -48,12 +48,26 @@ local Config = {
     ShieldSenseMaxParts = 75,
     ShieldSenseMinApproachSpeed = 30,
     ShieldSenseImpactWindow = 0.65,
+    -- Tsunami wavefront response. Escape targets are above the *observed top*
+    -- of the wave, not merely 100 studs above the player.
+    TsunamiProbeInterval = 0.085,
+    TsunamiProbeRadius = 165,
+    TsunamiProbeMaxParts = 190,
+    TsunamiMinRise = 135,
+    TsunamiCrestClearance = 90,
+    TsunamiHorizontalWarning = 54,
+    TsunamiQuietAfterPass = 0.85,
+    TsunamiMinimumHold = 1.4,
     -- Movement monitoring is opt-in, observational and never attacks players.
-    ObserverInterval = 0.22,
-    ObserverTeleportDistance = 85,
-    ObserverTeleportSpeed = 260,
-    ObserverFastSpeed = 115,
-    ObserverEvidenceCooldown = 0.8,
+    ObserverInterval = 0.10, -- faster observation (still sampled, not an exploit verdict)
+    ObserverTeleportDistance = 40,
+    ObserverTeleportSpeed = 175,
+    ObserverFastSpeed = 78,
+    ObserverFastMultiplier = 2.5,
+    ObserverAirHorizontalSpeed = 48,
+    ObserverAirClimbSpeed = 30,
+    ObserverFastAirSeconds = 0.55,
+    ObserverEvidenceCooldown = 0.32,
     ObserverAlertScore = 5,
     ObserverScoreDecayPerSecond = 0.20,
     ObserverMaxRecords = 35,
@@ -152,13 +166,14 @@ local Config = {
     HazardTags = {"ProtectionHazard", "Hazard", "Disaster", "Nuke", "NuclearMissile",
         "Tsunami", "TsunamiWave", "Lightning", "C4Bomb", "Volcano", "Meteor",
         "Deadzone", "Killzone", "Explosion", "Bomb", "Trap", "Lava"},
-    ConfirmedHazardTags = {"ProtectionHazard", "Nuke", "NuclearMissile", "TsunamiWave",
+    ConfirmedHazardTags = {"ProtectionHazard", "Nuke", "NuclearMissile", "Tsunami", "TsunamiWave", "Flood", "TidalWave", "Tornado", "Hurricane",
         "Lightning", "C4Bomb", "Meteor", "Deadzone", "Killzone", "Explosion",
         "Bomb", "Trap", "Lava"},
     -- These names identify candidate *parts*, not lethal proof or a damage radius.
     ProjectileHints = {"magma", "lava", "meteor", "meteorite", "missile", "nuclearmissile",
         "nuke", "nuclear", "rocket", "grenade", "bomb", "comet", "asteroid", "lightning",
-        "fireball", "acid", "tsunamiwave", "warhead"},
+        "fireball", "acid", "tsunamiwave", "tsunami", "tidalwave", "flashflood",
+        "flood", "wave", "surge", "tornado", "twister", "cyclone", "hurricane", "warhead"},
     HostileTags = {"Hostile", "Enemy", "Monster", "NPC_Hostile", "Chaser", "Boss", "Zombie"},
     FriendlyTags = {"Friendly", "Neutral", "Passive", "NonHostile", "ProtectionIgnore"},
     HazardAttributes = {"Damage", "DamageAmount", "Hazard", "KillZone", "IsDisaster",
@@ -200,6 +215,7 @@ local S = {
     minimized = false, dragging = nil, suppressMinimizeUntil = -math.huge,
     defenseLog = {}, defenseMode = "normal", threatSignatures = {},
     shieldSenseAt = -math.huge, shieldSenseOverlap = nil,
+    tsunamiProbeAt = -math.huge, tsunamiProbeOverlap = nil, tsunamiProbeInfo = nil,
     observers = {}, observerClock = 0, observingPlayer = nil, observingOriginalSubject = nil,
     observingOriginalType = nil, observerSummary = nil, lastReportRefresh = -math.huge,
 }
@@ -427,6 +443,22 @@ function H.projectileHintInTree(instance)
     return false
 end
 
+-- Recognize named wavefronts (including a Water part inside a Tsunami model).
+-- Generic water/sea/terrain is NOT a wave trigger. Movement or Active evidence
+-- is required before a wave can cause a special high-altitude dodge.
+function H.waveNameInTree(instance)
+    local node = instance
+    while node and node ~= Workspace do
+        local key = node.Name:lower():gsub("[^%w]", "")
+        if key:find("tsunami", 1, true) or key:find("tidalwave", 1, true)
+            or key:find("flashflood", 1, true) or key:find("floodwave", 1, true)
+            or key:find("risingwater", 1, true) or key == "flood"
+            or key == "wave" or key == "surge" then return true end
+        node = node.Parent
+    end
+    return false
+end
+
 function H.grabEvidence(instance)
     local current = instance
     while current and current ~= Workspace do
@@ -581,13 +613,14 @@ function H.hazardInfo(instance)
     local moving = velocity.Magnitude >= Config.ProjectileSpeedThreshold
     if moving or spinning then motion.lastMovingAt = now end
     local recentlyMoved = now - (motion.lastMovingAt or -math.huge) < 0.75
+    local waveNamed = H.waveNameInTree(instance)
     local hinted = instance:IsA("BasePart") and H.projectileHintInTree(instance)
     -- An ordinary named / static decoration should NEVER trigger the escape system.
     if not confirmed and not (hinted and (moving or spinning or recentlyMoved
         or explicitlyActive or H.grabEvidence(instance))) then return nil end
     -- Tags on large *container models* are often scenery: only explicitly marked
     -- regions/models qualify, and movement is evaluated using their own bounding box.
-    if instance:IsA("Model") and not (instance:GetAttribute("Lethal") == true
+    if instance:IsA("Model") and not (waveNamed or instance:GetAttribute("Lethal") == true
         or instance:GetAttribute("KillZone") == true
         or instance:GetAttribute("HazardRadius") ~= nil
         or H.hasTag(instance, Config.ConfirmedHazardTags)) then return nil end
@@ -595,10 +628,13 @@ function H.hazardInfo(instance)
     if activeRadius ~= nil then
         radius = instance:IsA("Explosion") and math.max(radius, activeRadius) or activeRadius
     end
+    local waveActive = waveNamed and (moving or recentlyMoved or explicitlyActive
+        or (part and not part.Anchored and (confirmed or activeRadius ~= nil)))
     return {instance = instance, name = instance.Name, bounds = bounds, size = size,
         velocity = velocity, angularSpeed = angularSpeed,
         acceleration = acceleration, sweptFrom = sweptFrom, sweptAt = sweptAt,
         moving = moving, spinning = spinning, recentlyMoved = recentlyMoved,
+        wave = waveActive,
         active = explicitlyActive, radius = radius, grabbed = H.grabEvidence(instance),
         erratic = abruptReversal, teleported = teleported,
         explosion = instance:IsA("Explosion"), explicit = confirmed}
@@ -724,6 +760,7 @@ function H.hazardCandidate(instance)
     if H.ignored(instance) then return false end
     if instance:IsA("Explosion") then return true end
     if instance:IsA("BasePart") and H.projectileHintInTree(instance) then return true end
+    if instance:IsA("Model") and H.waveNameInTree(instance) then return true end
     if not (instance:IsA("BasePart") or instance:IsA("Model")) then return false end
     local cur = instance
     while cur and cur ~= Workspace do
@@ -760,6 +797,124 @@ function H.hazardSnapshot()
     end
     S.hazardCache, S.hazardCacheAt = records, now
     return records
+end
+
+-- Evaluate a wavefront in the X/Z plane so a wave passing *below* a
+-- successfully lifted character remains a threat to the saved ground spot.
+function H.tsunamiFootprint(info, position)
+    if not info or not info.wave then return false, math.huge end
+    local relative = info.bounds:PointToObjectSpace(position)
+    local half = info.size * 0.5
+    local dx = math.max(0, math.abs(relative.X) - half.X)
+    local dz = math.max(0, math.abs(relative.Z) - half.Z)
+    local planar = math.sqrt(dx * dx + dz * dz)
+    local towards = info.velocity.X * (position.X - info.bounds.Position.X)
+        + info.velocity.Z * (position.Z - info.bounds.Position.Z)
+    local reach = Config.TsunamiHorizontalWarning
+        + math.min(60, Vector3.new(info.velocity.X, 0, info.velocity.Z).Magnitude * 0.55)
+    local nearby = planar <= reach
+    return nearby and (towards > 0 or planar <= 18), planar
+end
+
+function H.tsunamiDanger(info, position)
+    local approaching, planar = H.tsunamiFootprint(info, position)
+    if not approaching then return false, planar end
+    local crest = info.bounds.Position.Y + info.size.Y * 0.5
+    return position.Y <= crest + 9, planar
+end
+
+-- A bounded local probe catches broad moving waves even if the regular hazard
+-- list was limited by other nearby parts. Dormant scenery is not an escape cue.
+function H.findTsunamiThreat(position)
+    if not S.flags.lock or not H.ready() then return nil end
+    local now = os.clock()
+    if now - (S.tsunamiProbeAt or -math.huge) < Config.TsunamiProbeInterval then
+        local cached = S.tsunamiProbeInfo
+        if cached and H.tsunamiDanger(cached, position) then return cached end
+        return nil
+    end
+    S.tsunamiProbeAt = now
+    local overlap = S.tsunamiProbeOverlap
+    if not overlap then
+        overlap = OverlapParams.new()
+        overlap.FilterType = Enum.RaycastFilterType.Exclude
+        overlap.MaxParts = Config.TsunamiProbeMaxParts
+        S.tsunamiProbeOverlap = overlap
+    end
+    overlap.FilterDescendantsInstances = {S.context.character}
+    local best, bestDistance, seen = nil, math.huge, {}
+    -- Use already tracked wavefronts first. Then query nearby parts without
+    -- scanning the whole map or indexing unrelated water decorations.
+    for _, info in ipairs(H.hazardSnapshot()) do
+        if info.wave then
+            seen[info.instance] = true
+            local danger, dist = H.tsunamiDanger(info, position)
+            if danger and dist < bestDistance then best, bestDistance = info, dist end
+        end
+    end
+    local parts = Workspace:GetPartBoundsInRadius(position, Config.TsunamiProbeRadius, overlap)
+    for _, part in ipairs(parts) do
+        if part:IsA("BasePart") and not seen[part] and H.waveNameInTree(part) then
+            seen[part] = true
+            if H.hazardCandidate(part) then
+                local info = H.hazardInfo(part)
+                if info and info.wave then
+                    local danger, dist = H.tsunamiDanger(info, position)
+                    if danger and dist < bestDistance then best, bestDistance = info, dist end
+                    if not S.hazards[part] then S.hazards[part] = true; S.hazardCache = nil end
+                end
+            end
+        end
+    end
+    S.tsunamiProbeInfo = best
+    return best
+end
+
+-- High-above-wave emergency escape: relative to the actual wave crest, with
+-- a minimum rise. Avoid side-only dodges that leave the player inside water.
+function H.escapeAboveTsunami(info)
+    if not info or not info.wave or not S.flags.lock or not H.ready() then return false end
+    local now = os.clock()
+    local current = S.context.root.CFrame
+    local home = S.escape and S.escape.home or S.lockTarget or current
+    local crest = info.bounds.Position.Y + info.size.Y * 0.5
+    local requiredY = math.max(current.Position.Y + Config.TsunamiMinRise,
+        crest + Config.TsunamiCrestClearance, home.Position.Y + Config.TsunamiMinRise)
+    local ceiling = home.Position.Y + Config.ChaseMaxHeight
+    if requiredY > ceiling then
+        H.notice("Tsunami crest exceeds permitted escape height", 3)
+        return false
+    end
+    if S.escape and S.escape.tsunamiObject == info.instance
+        and current.Position.Y >= crest + Config.TsunamiCrestClearance - 8 then
+        S.escape.earliestReturn = math.max(S.escape.earliestReturn, now + Config.TsunamiMinimumHold)
+        S.escape.safeSince = nil
+        return true
+    end
+    local orientation = current - current.Position
+    local offset = current.Position - info.bounds.Position
+    local flat = Vector3.new(offset.X, 0, offset.Z)
+    flat = flat.Magnitude > 0.1 and flat.Unit or Vector3.new(1, 0, 0)
+    local side = Vector3.new(-flat.Z, 0, flat.X)
+    local destinations = {Vector3.zero, flat * 15, -flat * 15,
+        side * 20, -side * 20, flat * 35, -flat * 35}
+    for _, horizontal in ipairs(destinations) do
+        local where = Vector3.new(current.Position.X + horizontal.X, requiredY, current.Position.Z + horizontal.Z)
+        local dest = CFrame.new(where) * orientation
+        if H.clearSpace(dest) and not H.threatAt(info, where, Vector3.zero, false)
+            and H.beginEscapeMove(dest, "emergency", home, "tsunami high escape") then
+            S.escape.tsunamiObject = info.instance
+            S.escape.earliestReturn = now + Config.TsunamiMinimumHold
+            S.homeThreatAt = now
+            S.lastEmergency, S.lastEscape = now, now
+            H.logEvent("Tsunami", ("High escape: wave crest %.0f, target %.0f studs Y")
+                :format(crest, requiredY))
+            H.notice("TSUNAMI: escaped above detected wave crest", 3)
+            return true
+        end
+    end
+    H.notice("Tsunami approaching; no verified clear high destination", 3)
+    return false
 end
 
 -- Fingerprints explain suspicious *objects*, not who owns or manipulated them.
@@ -1987,6 +2142,22 @@ function H.updateEscape()
     H.sampleNearbyHazards(false)
     local position = S.context.root.Position
     local home = S.escape and S.escape.home or S.lockTarget
+    -- High-wave escape takes priority over ordinary sideways/small hazard dodge.
+    -- Probe both the grounded home position and current position while airborne.
+    local wave = home and H.findTsunamiThreat(home.Position)
+    if wave then
+        S.homeThreatAt = now
+        if H.escapeAboveTsunami(wave) then return end
+    end
+    if S.escape and S.escape.tsunamiObject then
+        local object = S.escape.tsunamiObject
+        local existing = object and object.Parent and H.hazardInfo(object) or nil
+        if existing and existing.wave and home and H.tsunamiDanger(existing, home.Position) then
+            S.homeThreatAt = now
+            S.escape.safeSince = nil
+            S.escape.earliestReturn = math.max(S.escape.earliestReturn, now + Config.TsunamiQuietAfterPass)
+        end
+    end
     local severeAtHome = home and H.findSevereHazardNear(home.Position)
     if severeAtHome then
         S.lastSevereThreatAt, S.homeThreatAt = now, now
@@ -3755,6 +3926,7 @@ end
 function H.primeHazardIndex()
     S.urgentLastScan, S.urgentLastMove = -math.huge, -math.huge
     S.urgentOverlap = nil
+    S.tsunamiProbeAt, S.tsunamiProbeInfo, S.tsunamiProbeOverlap = -math.huge, nil, nil
     S.shieldSenseAt, S.shieldSenseOverlap = -math.huge, nil
     S.threatSignatures = {}
     S.hazardCache, S.lastProtectionScanAt = nil, -math.huge
@@ -3766,25 +3938,31 @@ end
 -- speed as proof of cheating; disasters, abilities and latency can look similar.
 function H.observerReason(root, humanoid, previous, position, now)
     local elapsed = now - previous.at
-    if elapsed < 0.1 or elapsed > 1.4 then return nil end
+    if elapsed < 0.035 or elapsed > 1.25 then return nil end
     if humanoid.Health <= 0 or humanoid.Sit or humanoid.SeatPart then return nil end
     local displacement = position - previous.position
     local distance = displacement.Magnitude
     local sampleSpeed = distance / elapsed
+    local horizontal = Vector3.new(displacement.X, 0, displacement.Z).Magnitude / elapsed
+    local climb = displacement.Y / elapsed
     local normal = math.max(16, humanoid.WalkSpeed)
+    -- A single network correction is evidence, not proof of exploiting.
     if distance >= Config.ObserverTeleportDistance
         and sampleSpeed >= Config.ObserverTeleportSpeed then
-        return "large position jump", sampleSpeed, 3
+        return "rapid position jump", sampleSpeed, 3
     end
-    if sampleSpeed >= math.max(Config.ObserverFastSpeed, normal * 3.8) then
-        return "unusually fast movement", sampleSpeed, 2
+    local airborne = humanoid.FloorMaterial == Enum.Material.Air
+    local airTime = airborne and previous.airSince and now - previous.airSince or 0
+    if airborne and airTime >= Config.ObserverFastAirSeconds
+        and horizontal >= Config.ObserverAirHorizontalSpeed then
+        return "sustained fast flight", horizontal, 2
     end
-    -- Air time on its own is not evidence of exploiting.
-    if previous.airSince and now - previous.airSince > 3.5
-        and humanoid.FloorMaterial == Enum.Material.Air
-        and math.abs(displacement.Y / elapsed) < 2
-        and Vector3.new(displacement.X, 0, displacement.Z).Magnitude / elapsed > 65 then
-        return "sustained rapid airborne travel", sampleSpeed, 1
+    if airborne and airTime >= Config.ObserverFastAirSeconds
+        and climb >= Config.ObserverAirClimbSpeed then
+        return "abnormal upward flight", climb, 2
+    end
+    if sampleSpeed >= math.max(Config.ObserverFastSpeed, normal * Config.ObserverFastMultiplier) then
+        return "abnormal movement speed", sampleSpeed, 2
     end
     return nil
 end
@@ -3887,6 +4065,7 @@ function H.maintainObserverCamera()
     local humanoid = observed.Character and observed.Character:FindFirstChildOfClass("Humanoid")
     if not camera or not observed.Parent then H.stopObserving(); return end
     if not humanoid or humanoid.Health <= 0 then H.stopObserving(); return end
+    if camera.CameraType ~= Enum.CameraType.Custom then camera.CameraType = Enum.CameraType.Custom end
     if camera.CameraSubject ~= humanoid then camera.CameraSubject = humanoid end
 end
 
@@ -4207,8 +4386,8 @@ if previousGui then
     previousGui:Destroy()
 end
 
--- v7.22 UI redesign: gameplay callbacks below are unchanged.
--- Screen-aware docking; categorized tabs; touch-friendly controls; fixed status footer.
+-- v7.23: smooth panel corners; responsive tabs; rounded header + footer.
+-- Only the UI is restyled; non-UI gameplay functions remain unchanged here.
 local UI = {
     surface = Color3.fromRGB(15, 20, 29),
     header = Color3.fromRGB(23, 34, 48),
@@ -4228,7 +4407,7 @@ function H.make(className, properties, parent)
 end
 
 function H.corner(instance, radius)
-    H.make("UICorner", {CornerRadius = UDim.new(0, radius)}, instance)
+    return H.make("UICorner", {CornerRadius = UDim.new(0, radius)}, instance)
 end
 
 function H.viewport()
@@ -4315,7 +4494,10 @@ function H.layout()
             entry.button.Size = UDim2.fromOffset(tabWidth, 36)
         end
     end
-    S.ui.title.Text = width < 260 and "GR33D" or "GR33D   v7.22"
+    if S.ui.minimizeCorner then
+        S.ui.minimizeCorner.CornerRadius = UDim.new(0, show and 9 or 16)
+    end
+    S.ui.title.Text = width < 260 and "GR33D" or "GR33D   v7.23"
     S.ui.title.TextSize = width < 260 and 16 or 19
     if S.ui.tagline then S.ui.tagline.Visible = show and width >= 280 end
     S.ui.minimize.Size = show and UDim2.fromOffset(30, 30) or UDim2.fromScale(1, 1)
@@ -4392,19 +4574,30 @@ S.ui.dockedRight = true
 S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true,
     BackgroundColor3 = UI.surface, BorderSizePixel = 0,
     ClipsDescendants = true, Position = UDim2.fromOffset(12, 12)}, S.ui.gui)
-H.corner(S.ui.panel, 14)
-H.make("UIStroke", {Thickness = 1.2, Color = UI.border}, S.ui.panel)
+H.corner(S.ui.panel, 16)
+H.make("UIStroke", {Thickness = 1.2, Color = UI.border,
+    LineJoinMode = Enum.LineJoinMode.Round}, S.ui.panel)
 
+-- A UICorner rounds only its own GuiObject, not its children. Give header
+-- and footer their own round backgrounds; square fill only their inner edges.
+-- This avoids dark square overlays at the outer panel corners.
+local headerGradient = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(25, 57, 64)),
+    ColorSequenceKeypoint.new(1, UI.header)})
 S.ui.header = H.make("Frame", {Name = "DragHeader", Active = true, Size = UDim2.new(1, 0, 0, 64),
     BackgroundColor3 = UI.header, BorderSizePixel = 0}, S.ui.panel)
-H.make("UIGradient", {Rotation = 0, Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(25, 57, 64)),
-    ColorSequenceKeypoint.new(1, UI.header)})}, S.ui.header)
+H.corner(S.ui.header, 16)
+H.make("UIGradient", {Rotation = 0, Color = headerGradient}, S.ui.header)
+-- Fill the lower 16px of the header to retain a straight dividing edge.
+local headerInnerFill = H.make("Frame", {Name = "HeaderInnerFill",
+    Position = UDim2.fromOffset(0, 16), Size = UDim2.new(1, 0, 1, -16),
+    BackgroundColor3 = UI.header, BorderSizePixel = 0}, S.ui.header)
+H.make("UIGradient", {Rotation = 0, Color = headerGradient}, headerInnerFill)
 H.make("Frame", {Position = UDim2.fromOffset(12, 17), Size = UDim2.fromOffset(4, 30),
     BackgroundColor3 = UI.accent, BorderSizePixel = 0}, S.ui.header)
 S.ui.title = H.make("TextLabel", {Active = true, Size = UDim2.new(1, -115, 0, 37),
     Position = UDim2.fromOffset(24, 8), BackgroundTransparency = 1,
-    Text = "GR33D   v7.22", TextColor3 = UI.text,
+    Text = "GR33D   v7.23", TextColor3 = UI.text,
     TextSize = 19, Font = Enum.Font.GothamBold, TextXAlignment = Enum.TextXAlignment.Left}, S.ui.header)
 S.ui.tagline = H.make("TextLabel", {Position = UDim2.fromOffset(25, 35), Size = UDim2.new(1, -115, 0, 22),
     Text = "ADAPTIVE DEFENSE  •  CONTROL CENTER", BackgroundTransparency = 1,
@@ -4413,7 +4606,7 @@ S.ui.tagline = H.make("TextLabel", {Position = UDim2.fromOffset(25, 35), Size = 
 S.ui.minimize = H.make("TextButton", {Text = "−", AutoButtonColor = true,
     TextColor3 = UI.text, TextSize = 23, Font = Enum.Font.GothamBold,
     BackgroundColor3 = Color3.fromRGB(43, 54, 70)}, S.ui.panel)
-H.corner(S.ui.minimize, 9)
+S.ui.minimizeCorner = H.corner(S.ui.minimize, 9)
 S.ui.close = H.make("TextButton", {Size = UDim2.fromOffset(30, 30),
     Position = UDim2.new(1, -39, 0, 17), Text = "×", BackgroundColor3 = Color3.fromRGB(96, 49, 61),
     TextColor3 = UI.text, TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
@@ -4462,10 +4655,16 @@ S.ui.sectionCaption = H.make("TextLabel", {BackgroundTransparency = 1,
     TextSize = 10, Font = Enum.Font.GothamMedium, Visible = false}, S.ui.panel)
 S.ui.footer = H.make("Frame", {Name = "StatusFooter", BackgroundColor3 = Color3.fromRGB(21, 30, 42),
     BorderSizePixel = 0}, S.ui.panel)
+H.corner(S.ui.footer, 16)
+-- Fill the upper 16px so only the footer's BOTTOM corners stay rounded.
+H.make("Frame", {Name = "FooterInnerFill", Position = UDim2.fromOffset(0, 0),
+    Size = UDim2.new(1, 0, 0, 16), BackgroundColor3 = Color3.fromRGB(21, 30, 42),
+    BorderSizePixel = 0}, S.ui.footer)
 H.make("Frame", {Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = UI.border,
     BorderSizePixel = 0}, S.ui.footer)
-H.make("Frame", {Position = UDim2.fromOffset(14, 23), Size = UDim2.fromOffset(8, 8),
+local statusDot = H.make("Frame", {Position = UDim2.fromOffset(14, 23), Size = UDim2.fromOffset(8, 8),
     BorderSizePixel = 0, BackgroundColor3 = UI.accent}, S.ui.footer)
+H.corner(statusDot, 4)
 S.ui.status = H.make("TextLabel", {Size = UDim2.new(1, -49, 1, -8), Position = UDim2.fromOffset(31, 4),
     BackgroundTransparency = 1, Text = "Client protection tools ready",
     TextColor3 = Color3.fromRGB(183, 203, 222), TextSize = 10,
@@ -4631,7 +4830,7 @@ end
 H.connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), function()
     H.bindCamera()
     -- A replaced camera cannot be assumed to retain the original spectator state.
-    if S.observingPlayer then H.stopObserving() end
+    if S.observingPlayer then H.maintainObserverCamera() end
 end)
 H.bindCamera()
 
@@ -4795,6 +4994,12 @@ H.connect(RunService.PostSimulation, function(dt)
     end
     local ok, message = pcall(H.recordRunPosition)
     if not ok then H.report("Run movement observation", message) end
+end)
+
+-- Re-apply the observing target after Roblox's default camera update.
+-- This never moves the local character or changes the watched player.
+H.connect(RunService.RenderStepped, function()
+    if S.alive and S.flags.watch and S.observingPlayer then H.maintainObserverCamera() end
 end)
 
 H.connect(RunService.Heartbeat, function(deltaTime)
