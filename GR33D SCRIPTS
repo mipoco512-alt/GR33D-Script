@@ -1918,8 +1918,17 @@ function H.updateAimWorker()
 end
 
 function H.updateCombatWork()
+    if not H.enemyIndexNeeded() and H.stopCompatibilityDiscovery then H.stopCompatibilityDiscovery() end
     if not S.alive or not H.worldIndexNeeded() then return end
     H.stepCombatIndex()
+    if H.updateCompatibilityDiscovery then
+        local success, failure = pcall(H.updateCompatibilityDiscovery)
+        if not success then
+            pcall(H.stopCompatibilityDiscovery)
+            S.compatibilityError = tostring(failure)
+            H.report("Passive combat discovery", failure)
+        end
+    end
     local index, now = H.combatIndexState(), os.clock()
     if H.enemyIndexNeeded() and now >= (index.nextPlayers or -math.huge) then
         index.nextPlayers = now + 0.5
@@ -1937,10 +1946,321 @@ function H.updateCombatWork()
 end
 
 function H.clearCombatWork()
+    if H.stopCompatibilityDiscovery then H.stopCompatibilityDiscovery() end
     H.clearAimSelection()
     S.combatIndex = nil
 end
 
+
+function H.compatEnabled(state)
+    return S.alive and (S.flags.aim or S.flags.bullet) and S.compatibility == state
+end
+
+function H.compatConnect(state, signal, callback, bucket)
+    local connection = signal:Connect(function(...)
+        if H.compatEnabled(state) then callback(...) end
+    end)
+    table.insert(bucket or state.connections, connection)
+    return connection
+end
+
+function H.compatFeedName(instance)
+    if not instance:IsA("RemoteEvent") then return false end
+    if instance:GetAttribute("GR33D_CombatFeed") == true then return true end
+    local names = {projectilespawned = true, spawnprojectile = true, bulletfired = true,
+        firebullet = true, shotfired = true, enemyspawned = true, spawnenemy = true,
+        targetchanged = true, combattarget = true}
+    return names[instance.Name:lower():gsub("[^%w]", "")] == true
+end
+
+function H.compatReferenceKind(instance)
+    if not instance:IsA("ObjectValue") then return nil end
+    local name = instance.Name:lower()
+    if name == "projectile" or name == "bullet" then return "projectile" end
+    if name == "target" or name == "enemy" then return "target" end
+    return nil
+end
+
+function H.compatForeignShooter(packet)
+    for _, name in ipairs({"OwnerUserId", "ShooterUserId", "CreatorUserId", "Shooter", "Owner", "Creator"}) do
+        local value = rawget(packet, name)
+        if value ~= nil then
+            if typeof(value) == "Instance" then
+                if value ~= player and value ~= player.Character then return true end
+            elseif type(value) == "number" then
+                if not H.finite(value) or value ~= player.UserId then return true end
+            elseif type(value) == "string" then
+                if #value > 128 or (value ~= tostring(player.UserId) and value:lower() ~= player.Name:lower()) then return true end
+            else return true end
+        end
+    end
+    return false
+end
+
+function H.compatQueueObservation(state, kind, instance)
+    if not H.compatEnabled(state) or typeof(instance) ~= "Instance" or not instance.Parent then return false end
+    if kind == "projectile" then
+        if not S.flags.bullet or not instance:IsA("BasePart") then return false end
+    elseif kind ~= "target" or not (instance:IsA("Model") or instance:IsA("BasePart")) then return false end
+    local queued = state.pendingQueued[instance]
+    if queued and queued[kind] then return false end
+    if state.pendingCount >= 64 then state.dropped = state.dropped + 1; return false end
+    if not queued then queued = {}; state.pendingQueued[instance] = queued end
+    queued[kind] = true
+    state.pending[#state.pending + 1] = {kind = kind, instance = instance, at = os.clock()}
+    state.pendingCount += 1
+    return true
+end
+
+function H.compatQueueLive(state, instance)
+    if not H.compatEnabled(state) or not instance or state.liveQueued[instance] then return end
+    if #state.live - state.liveIndex + 1 >= 64 then state.truncated = true; return end
+    state.liveQueued[instance] = true
+    state.live[#state.live + 1] = instance
+end
+
+function H.compatObservePacket(state, feed, ...)
+    if not H.compatEnabled(state) then return end
+    if state.pendingCount >= 64 then state.dropped += 1; return end
+    local now = os.clock()
+    if now >= state.parseResetAt then state.parseResetAt, state.parsedMessages = now + 0.1, 0 end
+    if state.parsedMessages >= 16 then state.dropped += 1; return end
+    state.parsedMessages += 1
+    if not H.compatFeedName(feed) then H.compatDisconnect(state, feed); return end
+    for argument = 1, math.min(select("#", ...), 4) do
+        local packet = select(argument, ...)
+        if type(packet) == "table" and not H.compatForeignShooter(packet) then
+            H.compatQueueObservation(state, "projectile", rawget(packet, "Projectile"))
+            H.compatQueueObservation(state, "projectile", rawget(packet, "Bullet"))
+            H.compatQueueObservation(state, "target", rawget(packet, "Target"))
+            H.compatQueueObservation(state, "target", rawget(packet, "Enemy"))
+        end
+    end
+end
+
+function H.compatDisconnect(state, instance)
+    local remote = state.remotes[instance]
+    if remote then
+        remote:Disconnect()
+        state.remotes[instance] = nil
+        state.remoteCount -= 1
+    end
+    local reference = state.references[instance]
+    if reference then
+        reference:Disconnect()
+        state.references[instance] = nil
+        local slot = state.referenceLookup[instance]
+        if slot then state.referenceSlots[slot] = nil; state.referenceLookup[instance] = nil end
+        state.referenceCount -= 1
+    end
+end
+
+function H.compatInspect(state, instance)
+    if not instance or not instance.Parent or not instance:IsDescendantOf(state.root) then return end
+    state.scanned += 1
+    if H.compatFeedName(instance) then
+        if state.remotes[instance] then return end
+        if state.remoteCount >= 8 then state.truncated = true; return end
+        state.remotes[instance] = H.compatConnect(state, instance.OnClientEvent, function(...)
+            H.compatObservePacket(state, instance, ...)
+        end, {})
+        state.remoteCount += 1
+        return
+    end
+    local kind = H.compatReferenceKind(instance)
+    if not kind or state.references[instance] then return end
+    if state.referenceCount >= 32 then state.truncated = true; return end
+    state.references[instance] = H.compatConnect(state, instance:GetPropertyChangedSignal("Value"), function()
+        if H.compatReferenceKind(instance) ~= kind then
+            H.compatDisconnect(state, instance)
+            H.compatQueueLive(state, instance)
+            return
+        end
+        H.compatQueueObservation(state, kind, instance.Value)
+    end, {})
+    state.referenceCount += 1
+    for slot = 1, 32 do
+        if not state.referenceSlots[slot] then
+            state.referenceSlots[slot], state.referenceLookup[instance] = instance, slot
+            break
+        end
+    end
+    H.compatQueueObservation(state, kind, instance.Value)
+end
+
+function H.compatReplayStep(state)
+    local slot = state.replayIndex
+    if not slot then return false end
+    if not S.flags.bullet then state.replayIndex = nil; return false end
+    if slot > 32 then state.replayIndex = nil; return true end
+    state.replayIndex += 1
+    local instance = state.referenceSlots[slot]
+    if instance and state.references[instance] and H.compatReferenceKind(instance) == "projectile" then
+        H.compatQueueObservation(state, "projectile", instance.Value)
+    end
+    return true
+end
+
+function H.compatDiscoverStep(state)
+    local job = state.jobs[#state.jobs]
+    if not job then state.complete = true; return false end
+    local instance = job.instance
+    if instance ~= state.root and (not instance.Parent or not instance:IsDescendantOf(state.root)) then
+        state.jobs[#state.jobs] = nil
+        return true
+    end
+    if not job.children then
+        if instance ~= state.root then H.compatInspect(state, instance) end
+        local children = instance:GetChildren()
+        local count = math.min(#children, 256)
+        job.children, job.cursor = table.move(children, 1, count, 1, {}), 1
+        if #children > count then state.truncated = true end
+        return true
+    end
+    local child = job.children[job.cursor]
+    if not child then
+        state.jobs[#state.jobs] = nil
+        if #state.jobs == 0 then state.complete = true end
+    else
+        job.children[job.cursor] = false
+        job.cursor += 1
+        if #state.jobs < 24 then
+            state.jobs[#state.jobs + 1] = {instance = child}
+        else
+            H.compatInspect(state, child)
+            state.truncated = true
+        end
+    end
+    return true
+end
+
+function H.compatLiveStep(state)
+    local instance = state.live[state.liveIndex]
+    if not instance then return false end
+    state.live[state.liveIndex] = false
+    state.liveIndex += 1
+    state.liveQueued[instance] = nil
+    H.compatInspect(state, instance)
+    if state.liveIndex > #state.live then state.live, state.liveIndex = {}, 1
+    elseif state.liveIndex > 64 then
+        state.live = table.move(state.live, state.liveIndex, #state.live, 1, {})
+        state.liveIndex = 1
+    end
+    return true
+end
+
+function H.compatObservationStep(state, now)
+    local observation = state.pending[state.pendingIndex]
+    if not observation then return false end
+    if observation.kind == "projectile" and state.registrations >= 2 and now - observation.at <= 2 then return false end
+    state.pending[state.pendingIndex] = false
+    state.pendingIndex += 1
+    state.pendingCount -= 1
+    local instance = observation.instance
+    local queued = state.pendingQueued[instance]
+    if queued then
+        queued[observation.kind] = nil
+        if not next(queued) then state.pendingQueued[instance] = nil end
+    end
+    if now - observation.at <= 2 and instance.Parent and instance:IsDescendantOf(Workspace) then
+        if observation.kind == "target" then
+            H.queueCombatObject(instance)
+        elseif S.flags.bullet and H.ready() and not S.guidedBullets[instance]
+            and H.bulletOwner(instance) == tostring(player.UserId) and H.bulletOwnershipEvidence(instance) then
+            state.registrations += 1
+            local accepted = H.registerBullet(instance)
+            if accepted then state.accepted += 1 end
+        end
+    end
+    if state.pendingIndex > #state.pending then state.pending, state.pendingIndex = {}, 1
+    elseif state.pendingIndex > 64 then
+        state.pending = table.move(state.pending, state.pendingIndex, #state.pending, 1, {})
+        state.pendingIndex = 1
+    end
+    return true
+end
+
+function H.startCompatibilityDiscovery()
+    if not S.alive or not (S.flags.aim or S.flags.bullet) then return end
+    S.compatibilityError = nil
+    if S.compatibility then
+        if S.flags.bullet then S.compatibility.replayIndex = 1 end
+        return
+    end
+    local state = {connections = {}, remotes = {}, references = {}, remoteCount = 0, referenceCount = 0,
+        referenceSlots = {}, referenceLookup = {},
+        jobs = {}, live = {}, liveIndex = 1, liveQueued = setmetatable({}, {__mode = "k"}),
+        pending = {}, pendingIndex = 1, pendingCount = 0, pendingQueued = setmetatable({}, {__mode = "k"}),
+        scanned = 0, accepted = 0, dropped = 0, registrations = 0, turn = 0,
+        complete = false, unsupported = false, truncated = false, nextStep = -math.huge,
+        parseResetAt = -math.huge, parsedMessages = 0}
+    S.compatibility = state
+    local available, root = pcall(function() return game:GetService("ReplicatedStorage") end)
+    if not available or not root then state.unsupported, state.complete = true, true; return end
+    state.root = root
+    state.jobs[1] = {instance = root}
+    H.compatConnect(state, root.DescendantAdded, function(instance) H.compatQueueLive(state, instance) end)
+    H.compatConnect(state, root.DescendantRemoving, function(instance) H.compatDisconnect(state, instance) end)
+    H.compatConnect(state, root.Destroying, function() H.stopCompatibilityDiscovery() end)
+end
+
+function H.updateCompatibilityDiscovery()
+    local state = S.compatibility
+    if not state then return end
+    if not H.compatEnabled(state) then H.stopCompatibilityDiscovery(); return end
+    if state.unsupported then return end
+    local now = os.clock()
+    if now < state.nextStep then return end
+    state.nextStep, state.registrations = now + 0.1, 0
+    local deadline, processed = now + 0.001, 0
+    while processed < 16 and os.clock() < deadline do
+        local worked = false
+        for attempt = 1, 4 do
+            state.turn += 1
+            local channel = state.turn % 4
+            if channel == 0 then worked = H.compatDiscoverStep(state)
+            elseif channel == 1 then worked = H.compatLiveStep(state)
+            elseif channel == 2 then worked = H.compatObservationStep(state, now)
+            else worked = H.compatReplayStep(state) end
+            if worked then break end
+        end
+        if not worked then break end
+        processed += 1
+    end
+    state.lastProcessed = processed
+end
+
+function H.stopCompatibilityDiscovery()
+    local state = S.compatibility
+    if not state then return end
+    S.compatibility = nil
+    for instance in pairs(state.remotes) do H.compatDisconnect(state, instance) end
+    for instance in pairs(state.references) do H.compatDisconnect(state, instance) end
+    for _, connection in ipairs(state.connections) do connection:Disconnect() end
+    state.connections, state.jobs, state.live, state.pending = {}, {}, {}, {}
+    table.clear(state.liveQueued)
+    table.clear(state.pendingQueued)
+    table.clear(state.referenceSlots)
+    table.clear(state.referenceLookup)
+    state.replayIndex = nil
+    state.remoteCount, state.referenceCount, state.pendingCount = 0, 0, 0
+end
+
+function H.compatibilitySummary()
+    if S.compatibilityError then return "Replicated discovery paused: " .. tostring(S.compatibilityError):sub(1, 70) end
+    if not (S.flags.aim or S.flags.bullet) then return "Replicated discovery off" end
+    local state = S.compatibility
+    if state and state.truncated then
+        if not state.complete then return "Limited replicated scan · scanning supported feeds" end
+        local feeds = state.remoteCount + state.referenceCount
+        if feeds > 0 then return "Limited replicated scan · " .. tostring(feeds) .. " feeds · waiting for compatible local shots" end
+        return "Limited replicated scan · weapon integration required"
+    end
+    if state and not state.complete then return "Scanning replicated feeds" end
+    local feeds = state and (state.remoteCount + state.referenceCount) or 0
+    if feeds > 0 then return tostring(feeds) .. " combat feeds · waiting for compatible local shots" end
+    return "No supported replicated feed · weapon integration required"
+end
 
 function H.refreshObject(instance)
     H.invalidateAimObject(instance)
@@ -2003,6 +2323,7 @@ function H.queueBranch(instance)
 end
 
 function H.clearInactiveIndexes()
+    if not H.enemyIndexNeeded() and H.stopCompatibilityDiscovery then H.stopCompatibilityDiscovery() end
     if H.worldIndexNeeded() then return end
     S.pending, S.pendingIndex = {}, 1
     for instance in pairs(S.watchers) do H.removeObject(instance) end
@@ -4310,8 +4631,9 @@ end
 function H.updateSwitches()
     for key, switch in pairs(S.switches) do
         local enabled = S.flags[key]
-        switch.button.BackgroundColor3 = enabled and Color3.fromRGB(39, 168, 131) or Color3.fromRGB(55, 66, 83)
-        switch.knob.Position = enabled and UDim2.new(1, -30, 0.5, -12) or UDim2.new(0, 6, 0.5, -12)
+        local track = switch.track or switch.button
+        track.BackgroundColor3 = enabled and Color3.fromRGB(39, 168, 131) or Color3.fromRGB(55, 66, 83)
+        switch.knob.Position = enabled and UDim2.new(1, -20, 0.5, -8) or UDim2.new(0, 4, 0.5, -8)
     end
 end
 
@@ -5233,7 +5555,10 @@ function H.bulletGuidanceSummary()
         local status = counts[state.status] ~= nil and state.status or "acquiring"
         counts[status] += 1
     end
-    if total == 0 then return "Awaiting compatible local projectiles" end
+    if total == 0 then
+        if H.compatibilitySummary then return H.compatibilitySummary() end
+        return "Awaiting compatible local projectiles"
+    end
     return string.format("%d tracking · %d routing · %d blocked · %d seeking",
         counts.tracking, counts.routing, counts.blocked, counts.acquiring)
 end
@@ -5277,6 +5602,14 @@ function H.primeEnemyIndex()
         H.queueCombatBranch(Workspace)
     end
     if S.flags.bullet then index.bulletSeeded = true end
+    if H.startCompatibilityDiscovery then
+        local success, failure = pcall(H.startCompatibilityDiscovery)
+        if not success then
+            pcall(H.stopCompatibilityDiscovery)
+            S.compatibilityError = tostring(failure)
+            H.report("Passive combat discovery", failure)
+        end
+    end
 end
 
 -- Lock scans a bounded nearby region instead of indexing every descendant of
@@ -5557,7 +5890,7 @@ function H.setToggle(key, enabled)
         elseif key == "bullet" then
             if enabled then
                 H.primeEnemyIndex()
-                H.notice("Bullet Aim ready for compatible guns; awaiting projectile or shot integration", 5)
+                H.notice("Bullet Aim: passive compatibility scan queued; weapon support is not guaranteed", 5)
             else H.stopBulletAim() end
         elseif key == "watch" then
             S.observerClock = 0
@@ -5750,6 +6083,7 @@ function H.shutdown(destroyGui)
         if not ok then H.report("Shutdown skywalk landing", message) end
     end
     H.stopObserving()
+    if H.endPanelDrag then H.endPanelDrag(nil, true) end
     S.alive = false
     H.disconnectAll(S.connections)
     if S.cameraConnection then S.cameraConnection:Disconnect(); S.cameraConnection = nil end
@@ -5804,6 +6138,11 @@ function H.corner(instance, radius)
 end
 
 function H.viewport()
+    local gui = S.ui.gui
+    local size = gui and gui.AbsoluteSize
+    if size and H.finite(size.X) and H.finite(size.Y) and size.X > 0 and size.Y > 0 then
+        return size
+    end
     local camera = Workspace.CurrentCamera
     return camera and camera.ViewportSize or Vector2.new(800, 600)
 end
@@ -5829,125 +6168,203 @@ end
 
 function H.section(name, description)
     S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
-    local group = H.make("Frame", {Size = UDim2.new(1, 0, 0, 50),
+    local group = H.make("Frame", {Size = UDim2.new(1, 0, 0, 32),
         BackgroundTransparency = 1, LayoutOrder = S.ui.nextOrder}, S.ui.scroll)
-    H.make("Frame", {Size = UDim2.fromOffset(4, 27), Position = UDim2.fromOffset(1, 13),
-        BorderSizePixel = 0, BackgroundColor3 = UI.accent}, group)
-    H.make("TextLabel", {Position = UDim2.fromOffset(15, 5), Size = UDim2.new(1, -15, 0, 23),
+    H.make("Frame", {Size = UDim2.fromOffset(3, 24), Position = UDim2.fromOffset(2, 4),
+        BackgroundColor3 = UI.accent}, group)
+    H.make("TextLabel", {Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -12, 0, 18),
         BackgroundTransparency = 1, Text = name, TextSize = 14, Font = Enum.Font.GothamBold,
-        TextColor3 = UI.text, TextXAlignment = Enum.TextXAlignment.Left}, group)
-    H.make("TextLabel", {Position = UDim2.fromOffset(15, 27), Size = UDim2.new(1, -15, 0, 20),
-        BackgroundTransparency = 1, Text = description, TextSize = 11, Font = Enum.Font.Gotham,
+        TextColor3 = UI.text, TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd}, group)
+    H.make("TextLabel", {Position = UDim2.fromOffset(12, 17), Size = UDim2.new(1, -12, 0, 15),
+        BackgroundTransparency = 1, Text = description, TextSize = 10, Font = Enum.Font.Gotham,
         TextColor3 = UI.muted, TextXAlignment = Enum.TextXAlignment.Left,
         TextTruncate = Enum.TextTruncate.AtEnd}, group)
 end
 
-function H.positionPanel(x,y)
-    local bounds=S.ui.dragBounds
+function H.panelPointerMatches(expected, input)
+    if not expected or not input then return false end
+    return expected == input or (expected.UserInputType == Enum.UserInputType.MouseButton1
+        and input.UserInputType == Enum.UserInputType.MouseButton1)
+end
+
+function H.setPanelMinimized(enabled)
+    if not S.alive or not S.ui.panel or not S.ui.panel.Parent or S.minimized == enabled then return end
+    local panel = S.ui.panel
+    local previous = Vector2.new(panel.Position.X.Offset, panel.Position.Y.Offset)
+    if S.minimized then
+        S.ui.launcherPosition = previous
+    else
+        S.ui.windowPosition = previous
+        if not S.ui.launcherPosition then
+            local origin = S.ui.gui.AbsolutePosition
+            local control = S.ui.minimize.AbsolutePosition
+            S.ui.launcherPosition = Vector2.new(control.X - origin.X, control.Y - origin.Y)
+        end
+    end
+    H.endPanelDrag(nil, true)
+    S.ui.dockedRight = false
+    S.minimized = enabled
+    H.layout()
+    if not enabled then
+        local viewport = H.viewport()
+        local size = panel.Size
+        local position = S.ui.windowPosition or previous
+        H.positionPanel(math.clamp(position.X, 0, math.max(0, viewport.X - size.X.Offset)),
+            math.clamp(position.Y, 0, math.max(0, viewport.Y - size.Y.Offset)))
+    end
+end
+
+function H.activatePanelToggle(input)
+    if not S.alive then return end
+    local pointer = input and (input.UserInputType == Enum.UserInputType.Touch
+        or input.UserInputType == Enum.UserInputType.MouseButton1)
+    local gesture = S.ui.toggleGesture
+    if pointer then
+        if gesture and not H.panelPointerMatches(gesture.input, input) then return end
+        if S.dragging and not H.panelPointerMatches(S.dragging.input, input) then return end
+        if input.UserInputState == Enum.UserInputState.Cancel then return end
+        if S.dragging and input.UserInputType == Enum.UserInputType.Touch then H.updatePanelDrag(input) end
+        if gesture and (gesture.moved or gesture.cancelled or gesture.activated) then return end
+    elseif not input and S.dragging then
+        return
+    end
+    if gesture then gesture.activated = true end
+    H.setPanelMinimized(not S.minimized)
+end
+
+function H.beginPanelToggle(input)
+    if not S.alive or not input then return end
+    if input.UserInputType ~= Enum.UserInputType.Touch
+        and input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+    if S.dragging and not H.panelPointerMatches(S.dragging.input, input) then return end
+    local previous = S.ui.toggleGesture
+    if previous and previous.input == input and not previous.ended
+        and not previous.activated and not previous.cancelled then return end
+    S.ui.toggleGesture = {input = input, moved = false, cancelled = false, activated = false, ended = false}
+    if S.minimized then H.beginDrag(input) end
+end
+
+function H.positionPanel(x, y)
+    local bounds = S.ui.dragBounds
     if not bounds or not S.ui.panel or not S.ui.panel.Parent then return end
-    S.ui.panel.Position=UDim2.fromOffset(
-        math.clamp(x,bounds.minX,bounds.maxX),math.clamp(y,bounds.minY,bounds.maxY))
+    x, y = math.clamp(x, bounds.minX, bounds.maxX), math.clamp(y, bounds.minY, bounds.maxY)
+    S.ui.panel.Position = UDim2.fromOffset(x, y)
+    local position = Vector2.new(x, y)
+    if S.minimized then S.ui.launcherPosition = position
+    else S.ui.windowPosition = position end
 end
 
 function H.revealUITab(key)
-    local entry=S.ui.pages and S.ui.pages[key]
-    local navigation=S.ui.tabs
+    local entry = S.ui.pages and S.ui.pages[key]
+    local navigation = S.ui.tabs
     if not entry or not navigation or not navigation.Parent then return end
-    local width=entry.button.Size.X.Offset
-    local left=(entry.button.LayoutOrder-1)*(width+6)
-    local right=left+width
-    local viewportWidth=navigation.AbsoluteSize.X
-    local offset=navigation.CanvasPosition.X
-    if left<offset then offset=left
-    elseif right>offset+viewportWidth then offset=right-viewportWidth end
-    navigation.CanvasPosition=Vector2.new(math.clamp(offset,0,
-        math.max(0,navigation.CanvasSize.X.Offset-viewportWidth)),0)
+    local width = entry.button.Size.X.Offset
+    local left = (entry.button.LayoutOrder - 1) * (width + 4)
+    local right = left + width
+    local viewportWidth = navigation.AbsoluteSize.X
+    local offset = navigation.CanvasPosition.X
+    if left < offset then offset = left
+    elseif right > offset + viewportWidth then offset = right - viewportWidth end
+    navigation.CanvasPosition = Vector2.new(math.clamp(offset, 0,
+        math.max(0, navigation.CanvasSize.X.Offset - viewportWidth)), 0)
 end
 
 function H.layout()
     if not S.alive or not S.ui.panel or not S.ui.panel.Parent then return end
-    local viewport=H.viewport()
-    local topInset,bottomInset=Vector2.zero,Vector2.zero
-    pcall(function() topInset,bottomInset=game:GetService("GuiService"):GetGuiInset() end)
-    local top=math.max(12,topInset.Y+8)
-    local bottom=math.max(12,bottomInset.Y+8)
-    local width=math.min(480,math.max(180,viewport.X-16))
-    local availableHeight=math.max(160,viewport.Y-top-bottom)
-    local height=math.min(720,availableHeight,math.max(240,math.floor(availableHeight*0.82)))
-    local size=S.minimized and Vector2.new(56,56) or Vector2.new(width,height)
-    local panel=S.ui.panel
-    panel.Size=UDim2.fromOffset(size.X,size.Y)
-    local x,y=panel.Position.X.Offset,panel.Position.Y.Offset
+    local viewport = H.viewport()
+    local topInset, bottomInset = Vector2.zero, Vector2.zero
+    pcall(function() topInset, bottomInset = game:GetService("GuiService"):GetGuiInset() end)
+    local top = math.max(8, topInset.Y + 8)
+    local bottom = math.max(8, bottomInset.Y + 8)
+    local width = math.min(480, math.max(1, viewport.X - 16))
+    local height = math.min(720, math.max(1, viewport.Y - top - bottom))
+    local size = S.minimized and Vector2.new(56, 56) or Vector2.new(width, height)
+    local panel = S.ui.panel
+    panel.AnchorPoint = Vector2.zero
+    panel.Size = UDim2.fromOffset(size.X, size.Y)
+    local saved = S.minimized and S.ui.launcherPosition or S.ui.windowPosition
+    local x, y = saved and saved.X or panel.Position.X.Offset, saved and saved.Y or panel.Position.Y.Offset
+    local previousViewport = S.ui.lastViewport
+    local resized = previousViewport and (previousViewport.X ~= viewport.X or previousViewport.Y ~= viewport.Y)
+    S.ui.lastViewport = viewport
     if S.ui.dockedRight and not S.dragging then
-        x=viewport.X-size.X-12
-        y=top
+        x, y = viewport.X - size.X - 8, top
+    elseif resized and not S.minimized then
+        x = math.clamp(x, 0, math.max(0, viewport.X - size.X))
+        y = math.clamp(y, 0, math.max(0, viewport.Y - size.Y))
     end
-    local visibleWidth=math.min(size.X,184)
-    local visibleHeight=S.minimized and size.Y or math.min(size.Y,44)
-    local minimumY=math.min(math.max(0,topInset.Y),math.max(0,viewport.Y-visibleHeight))
-    S.ui.dragBounds={minX=visibleWidth-size.X,maxX=math.max(0,viewport.X-visibleWidth),
-        minY=minimumY,maxY=math.max(minimumY,viewport.Y-visibleHeight)}
-    H.positionPanel(x,y)
-    local show=not S.minimized
-    local compact=height<460
-    local showTagline=not compact and width>=340
-    local headerHeight=showTagline and 72 or 56
-    local tabsHeight=44
-    local footerHeight=64
-    local pageTop=headerHeight+6+tabsHeight+6
-    S.ui.header.Size=UDim2.new(1,0,0,headerHeight)
-    for _,item in ipairs({S.ui.header,S.ui.tabs,S.ui.footer,S.ui.close}) do item.Visible=show end
+    local visibleWidth = math.min(size.X, 184)
+    S.ui.dragBounds = S.minimized and {minX = 0, maxX = math.max(0, viewport.X - size.X),
+        minY = 0, maxY = math.max(0, viewport.Y - size.Y)}
+        or {minX = visibleWidth - size.X, maxX = math.max(0, viewport.X - visibleWidth),
+            minY = 0, maxY = math.max(0, viewport.Y - math.min(size.Y, 44))}
+    H.positionPanel(x, y)
+    local show = not S.minimized
+    local showTagline = height >= 560 and width >= 400
+    local headerHeight = showTagline and 60 or 48
+    local tabsHeight = 44
+    local footerHeight = showTagline and 52 or 48
+    local pageTop = headerHeight + 2 + tabsHeight + 2
+    S.ui.header.Size = UDim2.new(1, 0, 0, headerHeight)
+    for _, item in ipairs({S.ui.header, S.ui.tabs, S.ui.footer, S.ui.close}) do item.Visible = show end
     if S.ui.pages then
-        local count=0
-        for _ in pairs(S.ui.pages) do count+=1 end
-        local tabWidth=math.max(82,math.floor((width-24-math.max(0,count-1)*6)/math.max(1,count)))
-        local canvasWidth=count*tabWidth+math.max(0,count-1)*6
-        for key,entry in pairs(S.ui.pages) do
-            entry.scroll.Visible=show and S.ui.activeTab==key
-            entry.scroll.Position=UDim2.fromOffset(12,pageTop)
-            entry.scroll.Size=UDim2.new(1,-24,0,math.max(24,height-pageTop-footerHeight-10))
-            entry.button.Size=UDim2.fromOffset(tabWidth,44)
+        local count = 0
+        for _ in pairs(S.ui.pages) do count += 1 end
+        local tabWidth = math.max(52, math.floor((width - 16 - math.max(0, count - 1) * 4) / math.max(1, count)))
+        local canvasWidth = count * tabWidth + math.max(0, count - 1) * 4
+        for key, entry in pairs(S.ui.pages) do
+            entry.scroll.Visible = show and S.ui.activeTab == key
+            entry.scroll.Position = UDim2.fromOffset(8, pageTop)
+            entry.scroll.Size = UDim2.new(1, -16, 0, math.max(1, height - pageTop - footerHeight - 4))
+            entry.button.Size = UDim2.fromOffset(tabWidth, 44)
+            entry.button.TextSize = width < 350 and 10 or 11
+            entry.button.TextWrapped = false
         end
-        S.ui.tabs.CanvasSize=UDim2.fromOffset(canvasWidth,0)
+        S.ui.tabs.CanvasSize = UDim2.fromOffset(canvasWidth, 0)
     end
-    S.ui.tabs.Position=UDim2.fromOffset(12,headerHeight+6)
-    S.ui.tabs.Size=UDim2.new(1,-24,0,tabsHeight)
-    S.ui.footer.Position=UDim2.new(0,0,1,-footerHeight)
-    S.ui.footer.Size=UDim2.new(1,0,0,footerHeight)
-    S.ui.status.Position=UDim2.fromOffset(31,8)
-    S.ui.status.Size=UDim2.new(1,-45,0,21)
-    S.ui.status.TextSize=compact and 11 or 12
-    S.ui.statusDetail.Position=UDim2.fromOffset(14,31)
-    S.ui.statusDetail.Size=UDim2.new(1,-28,0,footerHeight-35)
-    S.ui.statusDetail.TextSize=compact and 10 or 11
-    S.ui.minimizeCorner.CornerRadius=UDim.new(0,show and 11 or 18)
-    S.ui.title.Text=width<300 and "GR33D" or "GR33D CONTROL"
-    S.ui.title.TextSize=compact and 17 or 19
-    S.ui.title.Position=UDim2.fromOffset(24,showTagline and 12 or 15)
-    S.ui.title.Size=UDim2.new(1,-137,0,26)
-    S.ui.tagline.Visible=show and showTagline
-    S.ui.tagline.Position=UDim2.fromOffset(25,41)
-    S.ui.tagline.Size=UDim2.new(1,-137,0,18)
-    local controlTop=math.floor((headerHeight-44)/2)
-    S.ui.close.Size=UDim2.fromOffset(44,44)
-    S.ui.close.Position=UDim2.new(1,-54,0,controlTop)
-    S.ui.minimize.Size=show and UDim2.fromOffset(44,44) or UDim2.fromScale(1,1)
-    S.ui.minimize.Position=show and UDim2.new(1,-104,0,controlTop) or UDim2.fromOffset(0,0)
-    S.ui.minimize.Text=show and "−" or "G"
-    S.ui.minimize.BackgroundColor3=show and Color3.fromRGB(38,52,60) or Color3.fromRGB(26,79,70)
+    S.ui.tabs.Position = UDim2.fromOffset(8, headerHeight + 2)
+    S.ui.tabs.Size = UDim2.new(1, -16, 0, tabsHeight)
+    S.ui.footer.Position = UDim2.new(0, 0, 1, -footerHeight)
+    S.ui.footer.Size = UDim2.new(1, 0, 0, footerHeight)
+    S.ui.status.Position = UDim2.fromOffset(27, 5)
+    S.ui.status.Size = UDim2.new(1, -39, 0, 18)
+    S.ui.status.TextSize = showTagline and 12 or 11
+    S.ui.statusDetail.Position = UDim2.fromOffset(12, 25)
+    S.ui.statusDetail.Size = UDim2.new(1, -24, 0, 18)
+    S.ui.statusDetail.TextSize = 10
+    S.ui.statusDetail.TextWrapped = false
+    S.ui.statusDetail.TextTruncate = Enum.TextTruncate.AtEnd
+    S.ui.statusDot.Position = UDim2.fromOffset(12, 11)
+    S.ui.statusDot.Size = UDim2.fromOffset(6, 6)
+    S.ui.minimizeCorner.CornerRadius = UDim.new(0, show and 9 or 28)
+    S.ui.title.Text = width < 300 and "GR33D" or "GR33D CONTROL"
+    S.ui.title.TextSize = showTagline and 18 or 17
+    S.ui.title.Position = UDim2.fromOffset(24, showTagline and 7 or 11)
+    S.ui.title.Size = UDim2.new(1, -137, 0, 24)
+    S.ui.tagline.Visible = show and showTagline
+    S.ui.tagline.Position = UDim2.fromOffset(25, 34)
+    S.ui.tagline.Size = UDim2.new(1, -137, 0, 16)
+    local controlTop = math.floor((headerHeight - 44) / 2)
+    S.ui.close.Size = UDim2.fromOffset(44, 44)
+    S.ui.close.Position = UDim2.new(1, -52, 0, controlTop)
+    S.ui.minimize.Size = show and UDim2.fromOffset(44, 44) or UDim2.fromScale(1, 1)
+    S.ui.minimize.Position = show and UDim2.new(1, -100, 0, controlTop) or UDim2.fromOffset(0, 0)
+    S.ui.minimize.Text = show and "−" or "G"
+    S.ui.minimize.BackgroundColor3 = show and Color3.fromRGB(38, 52, 60) or Color3.fromRGB(26, 79, 70)
     H.revealUITab(S.ui.activeTab)
     H.refreshStatus()
 end
 
 function H.row(label)
     S.ui.nextOrder = (S.ui.nextOrder or 0) + 1
-    local row = H.make("Frame", {Size = UDim2.new(1, 0, 0, 52),
-        BackgroundColor3 = UI.card, BorderSizePixel = 0,
-        LayoutOrder = S.ui.nextOrder}, S.ui.scroll)
-    H.corner(row, 9)
-    H.make("UIStroke", {Color = Color3.fromRGB(39, 52, 69), Thickness = 1}, row)
-    H.make("TextLabel", {Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -96, 1, 0),
-        BackgroundTransparency = 1, Text = label, TextColor3 = UI.text, TextSize = 13,
+    local row = H.make("Frame", {Size = UDim2.new(1, 0, 0, 46),
+        BackgroundTransparency = 1, LayoutOrder = S.ui.nextOrder}, S.ui.scroll)
+    H.make("Frame", {Name = "RowDivider", Size = UDim2.new(1, -8, 0, 1),
+        Position = UDim2.new(0, 4, 1, -1), BackgroundColor3 = UI.border,
+        BackgroundTransparency = 0.65}, row)
+    H.make("TextLabel", {Position = UDim2.fromOffset(4, 0), Size = UDim2.new(1, -76, 1, 0),
+        BackgroundTransparency = 1, Text = label, TextColor3 = UI.text, TextSize = 12,
         TextWrapped = true, Font = Enum.Font.GothamMedium,
         TextXAlignment = Enum.TextXAlignment.Left}, row)
     return row
@@ -5956,24 +6373,28 @@ end
 function H.toggleRow(key, label)
     local row = H.row(label)
     local button = H.make("TextButton", {Name = key .. "Toggle", Size = UDim2.fromOffset(52, 44),
-        Position = UDim2.new(1, -65, 0.5, -22), Text = "", AutoButtonColor = false,
-        BackgroundColor3 = UI.off}, row)
-    H.corner(button, 20)
-    local knob = H.make("Frame", {Size = UDim2.fromOffset(24, 24),
-        Position = UDim2.new(0, 6, 0.5, -12), BackgroundColor3 = UI.text}, button)
-    H.corner(knob, 12)
-    S.switches[key] = {button = button, knob = knob}
+        Position = UDim2.new(1, -56, 0.5, -22), Text = "", AutoButtonColor = false,
+        BackgroundTransparency = 1}, row)
+    local track = H.make("Frame", {Name = "SwitchTrack", Size = UDim2.fromOffset(44, 24),
+        Position = UDim2.new(0.5, -22, 0.5, -12), BackgroundColor3 = UI.off}, button)
+    H.corner(track, 12)
+    local knob = H.make("Frame", {Size = UDim2.fromOffset(16, 16),
+        Position = UDim2.new(0, 4, 0.5, -8), BackgroundColor3 = UI.text}, track)
+    H.corner(knob, 8)
+    S.switches[key] = {button = button, track = track, knob = knob}
     H.connect(button.Activated, function() H.setToggle(key, not S.flags[key]) end)
 end
 
 function H.numericRow(label, key, minimum, maximum, onChange)
     local row = H.row(label)
-    local input = H.make("TextBox", {Name = key .. "Input", Size = UDim2.fromOffset(68, 44),
-        Position = UDim2.new(1, -81, 0.5, -22), Text = tostring(S[key]), ClearTextOnFocus = false,
-        TextColor3 = UI.text, BackgroundColor3 = Color3.fromRGB(17, 25, 36),
+    local surface = H.make("Frame", {Name = "FieldSurface", Size = UDim2.fromOffset(58, 28),
+        Position = UDim2.new(1, -62, 0.5, -14), BackgroundColor3 = Color3.fromRGB(17, 25, 36)}, row)
+    H.corner(surface, 6)
+    H.make("UIStroke", {Color = UI.border, Thickness = 1}, surface)
+    local input = H.make("TextBox", {Name = key .. "Input", Size = UDim2.fromOffset(58, 44),
+        Position = UDim2.new(1, -62, 0.5, -22), Text = tostring(S[key]), ClearTextOnFocus = false,
+        TextColor3 = UI.text, BackgroundTransparency = 1, ZIndex = 2,
         TextSize = 14, Font = Enum.Font.GothamBold}, row)
-    H.corner(input, 6)
-    H.make("UIStroke", {Color = UI.border, Thickness = 1}, input)
     H.connect(input.FocusLost, function()
         local number = tonumber(input.Text)
         if H.finite(number) then
@@ -6002,6 +6423,11 @@ end
 
 S.ui.gui = H.make("ScreenGui", {Name = "DevPanelGui", ResetOnSpawn = false, IgnoreGuiInset = true,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1000}, playerGui)
+pcall(function()
+    S.ui.gui.ScreenInsets = Enum.ScreenInsets.None
+    S.ui.gui.ClipToDeviceSafeArea = false
+    S.ui.gui.SafeAreaCompatibility = Enum.SafeAreaCompatibility.None
+end)
 S.ui.dockedRight = true
 S.ui.panel = H.make("Frame", {Name = "MainFrame", Active = true,
     BackgroundColor3 = UI.surface, BorderSizePixel = 0,
@@ -6050,7 +6476,7 @@ S.ui.tabs = H.make("ScrollingFrame", {Name = "Navigation", BackgroundTransparenc
     ElasticBehavior = Enum.ElasticBehavior.Never}, S.ui.panel)
 H.make("UIListLayout", {FillDirection = Enum.FillDirection.Horizontal,
     HorizontalAlignment = Enum.HorizontalAlignment.Left, VerticalAlignment = Enum.VerticalAlignment.Center,
-    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6)}, S.ui.tabs)
+    SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4)}, S.ui.tabs)
 S.ui.pages = {}
 local tabs = {
     {"defense", "DEFENSE", "Physics, hazards and recovery"},
@@ -6075,9 +6501,9 @@ for i, info in ipairs(tabs) do
         AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 5,
         ScrollBarImageColor3 = Color3.fromRGB(83, 116, 131),
         ScrollingDirection = Enum.ScrollingDirection.Y}, S.ui.panel)
-    H.make("UIPadding", {PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 12),
-        PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 20)}, scroll)
-    H.make("UIListLayout", {Padding = UDim.new(0, 6),
+    H.make("UIPadding", {PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 8),
+        PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 12)}, scroll)
+    H.make("UIListLayout", {Padding = UDim.new(0, 4),
         SortOrder = Enum.SortOrder.LayoutOrder}, scroll)
     S.ui.pages[key] = {button = tab, scroll = scroll, accent = underline, description = description}
     H.connect(tab.Activated, function() H.openUITab(key) end)
@@ -6213,51 +6639,75 @@ H.connect(shutdownEvent.Event, function() H.shutdown(true) end)
 H.connect(S.ui.gui.Destroying, function() H.shutdown(false) end)
 if typeof(script) == "Instance" then H.connect(script.Destroying, function() H.shutdown(true) end) end
 H.connect(S.ui.close.Activated, function() H.shutdown(true) end)
-H.connect(S.ui.minimize.Activated, function()
-    -- A dragged minimized icon must not also expand on release.
-    if (S.dragging and S.dragging.moved) or os.clock() < S.suppressMinimizeUntil then return end
-    S.minimized = not S.minimized
-    H.layout()
-end)
+H.connect(S.ui.minimize.Activated, function(input) H.activatePanelToggle(input) end)
 
 function H.beginDrag(input)
-    if not S.alive or S.dragging or not S.ui.panel or not S.ui.panel.Parent then return end
-    if input.UserInputType~=Enum.UserInputType.MouseButton1 and input.UserInputType~=Enum.UserInputType.Touch then return end
-    S.ui.dockedRight=false
-    S.dragging={input=input,start=input.Position,last=input.Position,position=S.ui.panel.Position,
-        totalX=0,totalY=0,moved=false,ended=false}
+    if not S.alive or S.dragging or not S.ui.panel or not S.ui.panel.Parent or not input then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local drag = {input = input, start = input.Position, last = input.Position, position = S.ui.panel.Position,
+        totalX = 0, totalY = 0, moved = false, ended = false,
+        threshold = input.UserInputType == Enum.UserInputType.Touch and 8 or 4}
+    S.dragging = drag
+    drag.connection = input.Changed:Connect(function(property)
+        if S.dragging ~= drag or drag.ended then return end
+        if property == "Position" and input.UserInputType == Enum.UserInputType.Touch then
+            H.updatePanelDrag(input)
+        elseif property == "UserInputState" then
+            if input.UserInputState == Enum.UserInputState.Cancel then H.endPanelDrag(input, true)
+            elseif input.UserInputState == Enum.UserInputState.End then H.endPanelDrag(input, false) end
+        end
+    end)
 end
 
 function H.updatePanelDrag(input)
-    local drag=S.dragging
+    local drag = S.dragging
     if not S.alive or not drag or drag.ended then return end
-    local mouse=drag.input.UserInputType==Enum.UserInputType.MouseButton1
+    local mouse = drag.input.UserInputType == Enum.UserInputType.MouseButton1
     if mouse then
-        if input.UserInputType~=Enum.UserInputType.MouseMovement then return end
-        local delta=input.Delta
-        if not delta or (delta.X==0 and delta.Y==0) then delta=input.Position-drag.last end
-        drag.totalX+=delta.X
-        drag.totalY+=delta.Y
-        drag.last=input.Position
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local delta = input.Delta
+        if not delta or (delta.X == 0 and delta.Y == 0) then delta = input.Position - drag.last end
+        drag.totalX += delta.X
+        drag.totalY += delta.Y
+        drag.last = input.Position
     else
-        if input~=drag.input then return end
-        local delta=input.Position-drag.start
-        drag.totalX,drag.totalY=delta.X,delta.Y
+        if input ~= drag.input then return end
+        local delta = input.Position - drag.start
+        drag.totalX, drag.totalY = delta.X, delta.Y
     end
-    if drag.totalX*drag.totalX+drag.totalY*drag.totalY>16 then drag.moved=true end
-    H.positionPanel(drag.position.X.Offset+drag.totalX,drag.position.Y.Offset+drag.totalY)
+    if drag.totalX * drag.totalX + drag.totalY * drag.totalY > drag.threshold * drag.threshold then
+        drag.moved = true
+    end
+    if not drag.moved then return end
+    S.ui.dockedRight = false
+    local gesture = S.ui.toggleGesture
+    if gesture and H.panelPointerMatches(gesture.input, drag.input) then gesture.moved = true end
+    H.positionPanel(drag.position.X.Offset + drag.totalX, drag.position.Y.Offset + drag.totalY)
 end
 
-function H.endPanelDrag(input,forced)
-    local drag=S.dragging
-    if not drag then return end
-    if not forced and input~=drag.input and not (input
-        and input.UserInputType==Enum.UserInputType.MouseButton1
-        and drag.input.UserInputType==Enum.UserInputType.MouseButton1) then return end
-    drag.ended=true
-    if drag.moved then S.suppressMinimizeUntil=os.clock()+0.2 end
-    if forced then S.dragging=nil;return end
-    task.defer(function() if S.dragging==drag then S.dragging=nil end end)
+function H.endPanelDrag(input, forced)
+    local drag = S.dragging
+    if not drag then
+        local gesture = S.ui.toggleGesture
+        if gesture and (forced == true or H.panelPointerMatches(gesture.input, input)) then
+            gesture.ended = true
+            gesture.cancelled = gesture.cancelled or forced == true
+                or input.UserInputState == Enum.UserInputState.Cancel
+        end
+        return
+    end
+    if forced ~= true and not H.panelPointerMatches(drag.input, input) then return end
+    if forced ~= true and drag.input.UserInputType == Enum.UserInputType.Touch then H.updatePanelDrag(drag.input) end
+    drag.ended = true
+    if drag.connection then drag.connection:Disconnect(); drag.connection = nil end
+    local gesture = S.ui.toggleGesture
+    if gesture and H.panelPointerMatches(gesture.input, drag.input) then
+        gesture.ended = true
+        gesture.moved = gesture.moved or drag.moved
+        gesture.cancelled = gesture.cancelled or forced == true
+            or drag.input.UserInputState == Enum.UserInputState.Cancel
+    end
+    S.dragging = nil
 end
 
 S.ui.dragHandle=H.make("TextButton",{Name="DragHandle",Text="",AutoButtonColor=false,
@@ -6268,9 +6718,9 @@ H.connect(S.ui.dragHandle.InputBegan,H.beginDrag)
 H.connect(S.ui.header.InputBegan,H.beginDrag)
 H.connect(S.ui.title.InputBegan,H.beginDrag)
 H.connect(S.ui.tagline.InputBegan,H.beginDrag)
-H.connect(S.ui.minimize.InputBegan,function(input) if S.minimized then H.beginDrag(input) end end)
+H.connect(S.ui.minimize.InputBegan,function(input) H.beginPanelToggle(input) end)
 H.connect(UserInputService.InputChanged,H.updatePanelDrag)
-H.connect(UserInputService.InputEnded,H.endPanelDrag)
+H.connect(UserInputService.InputEnded,function(input) H.endPanelDrag(input,false) end)
 H.connect(UserInputService.WindowFocusReleased,function() H.endPanelDrag(nil,true) end)
 
 function H.bindCamera()
@@ -6289,6 +6739,10 @@ H.connect(Workspace:GetPropertyChangedSignal("CurrentCamera"), function()
     H.bindCamera()
     -- A replaced camera cannot be assumed to retain the original spectator state.
     if S.observingPlayer then H.maintainObserverCamera() end
+end)
+H.connect(S.ui.gui:GetPropertyChangedSignal("AbsoluteSize"),function()
+    H.endPanelDrag(nil,true)
+    H.layout()
 end)
 H.bindCamera()
 
