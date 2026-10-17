@@ -347,6 +347,8 @@ function H.statusBackground()
             sensing.." · "..tostring(S.hazardCache and #S.hazardCache or 0).." assessed threats",20
     end
     if S.flying then return "FLIGHT ACTIVE","Double-tap jump to stop · "..summary,20 end
+    local monsterSummary = S.flags.monster and H.npcSensorSummary and H.npcSensorSummary()
+    if monsterSummary then return "ANTI-MONSTER",monsterSummary,65 end
     if S.hovering then return "ANTI-MONSTER SKYWALK","Movement controls remain available · "..summary,30 end
     if S.observingPlayer then
         return "OBSERVING "..tostring(S.observingPlayer.Name),S.observerSummary or summary,20
@@ -362,7 +364,7 @@ function H.statusBackground()
     if S.flags.aim then
         return S.aimTarget and ("AUTO AIM · "..tostring(S.aimTarget.Name)) or "AUTO AIM · SEARCHING",
             S.flags.bullet and (S.bulletGuidanceStatus or "Waiting for compatible projectiles")
-                or "Visible, living hostile targets only · "..summary,15
+                or (H.targetAimStatus and H.targetAimStatus() or "Visible, living hostile targets only · "..summary),15
     end
     if S.flags.bullet then
         local count=0
@@ -1275,29 +1277,121 @@ function H.watchEnemyMetadata(instance)
 end
 
 function H.enemyOwner(instance)
-    if instance:IsA("Model") then return instance end
-    if not instance:IsA("BasePart") then return nil end
-    local current, fallback = instance.Parent, nil
-    while current and current ~= Workspace do
+    if not (instance:IsA("Model") or instance:IsA("BasePart")) then return nil end
+    local current, fallback, bodyOwner, depth = instance:IsA("Model") and instance or instance.Parent, nil, nil, 0
+    while current and current ~= Workspace and depth < 16 do
+        if current:IsA("Accessory") or current:IsA("Tool") then return nil end
         if current:IsA("Model") then
-            if current:FindFirstChildOfClass("Humanoid") or current:FindFirstChildOfClass("AnimationController")
-                or H.enemyDamageable(current) then return current end
-            -- Keep a real named/marked owning body; an arbitrary map model is
-            -- not the owner of a separately tagged, damageable monster part.
+            if current:FindFirstChildOfClass("Humanoid") then return current end
+            if not bodyOwner and (current:FindFirstChildOfClass("AnimationController")
+                or H.enemyDamageable(current)) then bodyOwner = current end
             if not fallback and H.npcMarked(current) then fallback = current end
         end
-        current = current.Parent
+        current, depth = current.Parent, depth + 1
     end
+    if bodyOwner then return bodyOwner end
+    if instance:IsA("Model") then return fallback or instance end
     if H.enemyDamageable(instance) or H.npcMarked(instance) then return instance end
     return fallback or instance
 end
 
+function H.targetBodyPart(instance, part, queryable)
+    if not instance or not part or not part:IsA("BasePart") or not part.Parent
+        or not H.finiteVector(part.Position) or not part:IsDescendantOf(Workspace)
+        or (part ~= instance and not part:IsDescendantOf(instance))
+        or (queryable and part.CanQuery == false) then return false end
+    local current, depth = part.Parent, 0
+    while current and current ~= instance and current ~= Workspace and depth < 16 do
+        if current:IsA("Accessory") or current:IsA("Tool")
+            or (current:IsA("Model") and (current:FindFirstChildOfClass("Humanoid")
+                or current:FindFirstChildOfClass("AnimationController"))) then return false end
+        current, depth = current.Parent, depth + 1
+    end
+    return part == instance or current == instance
+end
+
+function H.targetBodyParts(instance, extras)
+    local parts, seen = {}, {}
+    for _, name in ipairs({"Head", "UpperTorso", "Torso", "LowerTorso", "Body", "Chest", "Hitbox", "Root", "Core", "HumanoidRootPart"}) do
+        local part = instance:FindFirstChild(name)
+        if H.targetBodyPart(instance, part, false) then parts[#parts + 1], seen[part] = part, true end
+    end
+    if #parts > 0 and not extras then return parts end
+    local jobs, cursor, inspected = {{instance = instance, depth = 0}}, 1, 0
+    while cursor <= #jobs and inspected < 40 do
+        local job = jobs[cursor]
+        if not job.children then job.children, job.cursor = job.instance:GetChildren(), 1 end
+        local child = job.children[job.cursor]
+        if not child then cursor += 1
+        else
+            job.cursor, inspected = job.cursor + 1, inspected + 1
+            if H.targetBodyPart(instance, child, false) and not seen[child] then
+                parts[#parts + 1], seen[child] = child, true
+            elseif job.depth < 3 and (child:IsA("Folder") or child:IsA("Model"))
+                and not child:FindFirstChildOfClass("Humanoid")
+                and not child:FindFirstChildOfClass("AnimationController") and #jobs < 12 then
+                jobs[#jobs + 1] = {instance = child, depth = job.depth + 1}
+            end
+        end
+    end
+    return parts
+end
+
+function H.targetAimPart(instance, root)
+    if instance:IsA("BasePart") then
+        return H.targetBodyPart(instance, root, true)
+            and (root.Transparency == nil or root.Transparency < 0.98) and root or nil
+    end
+    local maximum = 24
+    if H.finiteVector(root.Size) then maximum = math.max(maximum, math.min(120, root.Size.Magnitude * 2)) end
+    local fallback, visible = nil, false
+    for pass = 1, 2 do
+        for _, part in ipairs(H.targetBodyParts(instance, pass == 2)) do
+            if (part.Position - root.Position).Magnitude <= maximum then
+                local rendered = part.Transparency == nil or part.Transparency < 0.98
+                if rendered then visible = true end
+                if H.targetBodyPart(instance, part, true) then
+                    if rendered then return part end
+                    fallback = fallback or part
+                end
+            end
+        end
+        if visible then break end
+    end
+    if not visible then return nil end
+    if H.targetBodyPart(instance, root, true) then return root end
+    return fallback
+end
+
+function H.targetAimStatus()
+    if S.aimRecord and not S.aimDirty then return "Live hostile body tracked · teammates/protected targets excluded" end
+    local index = S.combatIndex
+    if not index then return "Building loaded-world target index" end
+    local info = index.aimDiagnostics
+    if not info or os.clock() - info.at > 2 then return "Scanning loaded, living hostile bodies" end
+    if info.eligible == 0 then return "No eligible live hostile in recent scan · check game target metadata" end
+    if info.visible == 0 and info.offscreen > 0 and info.blocked == 0 then return "Hostile found · outside camera view or aim FOV" end
+    if info.blocked > 0 then return "Hostile found · body aim point obstructed" end
+    return "Validating live hostile target"
+end
+
 function H.enemyRoot(instance)
-    if instance:IsA("BasePart") then return instance end
+    if instance:IsA("BasePart") then return H.targetBodyPart(instance, instance, false) and instance or nil end
     if not instance:IsA("Model") then return nil end
-    local root = instance:FindFirstChild("HumanoidRootPart") or instance.PrimaryPart
-        or instance:FindFirstChild("Head") or instance:FindFirstChildWhichIsA("BasePart", true)
-    return root and root:IsA("BasePart") and root or nil
+    local humanoid = instance:FindFirstChildOfClass("Humanoid")
+    if humanoid and H.targetBodyPart(instance, humanoid.RootPart, false) then return humanoid.RootPart end
+    local named = instance:FindFirstChild("HumanoidRootPart")
+    if H.targetBodyPart(instance, named, false) then return named end
+    for _, name in ipairs({"UpperTorso", "Torso", "LowerTorso", "Body", "Chest", "Hitbox", "Root", "Core"}) do
+        local part = instance:FindFirstChild(name)
+        if H.targetBodyPart(instance, part, false) then return part end
+    end
+    local parts = H.targetBodyParts(instance)
+    for _, part in ipairs(parts) do
+        if H.targetBodyPart(instance, part, true) and (part.Transparency == nil or part.Transparency < 0.98) then return part end
+    end
+    if H.targetBodyPart(instance, instance.PrimaryPart, false) then return instance.PrimaryPart end
+    return parts[1]
 end
 
 function H.combatMetadata(instance, names, predicate)
@@ -1453,12 +1547,13 @@ function H.combatNameHostile(instance)
         ice = true, frost = true, dark = true, shadow = true, cave = true, sand = true,
         death = true, red = true, green = true, blue = true, big = true, small = true,
         alpha = true, super = true}
+    local suffixes = {npc = true, boss = true, elite = true, enemy = true}
     for word in pairs(H.tokens(instance.Name)) do
         word = word:gsub("%d", "")
         if genres[word] then return true end
         for genre in pairs(genres) do
-            if #word > #genre and word:sub(-#genre) == genre
-                and modifiers[word:sub(1, #word - #genre)] then return true end
+            if #word > #genre and ((word:sub(-#genre) == genre and modifiers[word:sub(1, #word - #genre)])
+                or (word:sub(1, #genre) == genre and suffixes[word:sub(#genre + 1)])) then return true end
         end
     end
     return false
@@ -1466,17 +1561,18 @@ end
 
 function H.combatHostile(instance, root, humanoid)
     local current = instance
+    local rig = humanoid ~= nil or (instance:IsA("Model") and H.combatKillable(instance, root, humanoid))
     local containers = {enemies = true, hostiles = true, monsters = true, zombies = true,
         undead = true, infected = true, demons = true, bosses = true}
     while current and current ~= Workspace do
         if H.enemyExplicitHostile(current) then return true end
-        if humanoid and current ~= instance and (current:IsA("Folder") or current:IsA("Model"))
+        if rig and current ~= instance and (current:IsA("Folder") or current:IsA("Model"))
             and containers[H.enemyWord(current.Name)] then return true end
         current = current.Parent
     end
     if root and H.enemyExplicitHostile(root) then return true end
     if humanoid and H.enemyExplicitHostile(humanoid) then return true end
-    return humanoid ~= nil and H.combatNameHostile(instance)
+    return rig and H.combatNameHostile(instance)
 end
 
 function H.enemyRecord(instance, origin, options)
@@ -1484,9 +1580,9 @@ function H.enemyRecord(instance, origin, options)
     if type(options) ~= "table" or typeof(instance) ~= "Instance"
         or typeof(origin) ~= "Vector3" or not H.finiteVector(origin) then return nil end
     if instance:IsA("Player") then instance = instance.Character end
-    if not instance or not instance.Parent or not instance:IsDescendantOf(Workspace) then return nil end
-    if not (instance:IsA("Model") or instance:IsA("BasePart")) then return nil end
-    if instance:IsA("BasePart") then instance = H.enemyOwner(instance) end
+    if not instance or not instance.Parent or not instance:IsDescendantOf(Workspace)
+        or not (instance:IsA("Model") or instance:IsA("BasePart")) then return nil end
+    instance = H.enemyOwner(instance)
     if not instance then return nil end
     local current, targetPlayer = instance, nil
     while current and current ~= Workspace do
@@ -1498,21 +1594,20 @@ function H.enemyRecord(instance, origin, options)
     end
     local humanoid = instance:IsA("Model") and instance:FindFirstChildOfClass("Humanoid") or nil
     local root = H.enemyRoot(instance)
-    if not root or not root.Parent or not root:IsDescendantOf(Workspace)
-        or not H.finiteVector(root.Position) or H.combatBlocked(instance, root, humanoid, targetPlayer)
+    if not root or H.combatBlocked(instance, root, humanoid, targetPlayer)
         or not H.combatKillable(instance, root, humanoid) then return nil end
     if targetPlayer then
         if options.allowPlayers == false or not H.autoAimEnemyPlayer({instance = instance,
             root = root, humanoid = humanoid, player = targetPlayer}) then return nil end
     elseif not H.combatHostile(instance, root, humanoid) then return nil end
+    local aimPart = H.targetAimPart(instance, root)
+    if not aimPart or H.combatFriendly(aimPart) or H.combatProtected(aimPart)
+        or H.combatOwnerFriendly(aimPart) then return nil end
     local distance = (root.Position - origin).Magnitude
     local range = options.range or Config.EnemyScanRange or 1400
     if not H.finite(range) or range < 0 or distance > range then return nil end
-    local head = instance:IsA("Model") and instance:FindFirstChild("Head") or nil
-    local aimPosition = root.Position
-    if head and head:IsA("BasePart") and H.finiteVector(head.Position) then aimPosition = head.Position end
     return {instance = instance, root = root, humanoid = humanoid, player = targetPlayer,
-        position = root.Position, aimPosition = aimPosition, distance = distance,
+        head = aimPart, position = aimPart.Position, aimPosition = aimPart.Position, distance = distance,
         cameraEligible = true, bulletEligible = true}
 end
 
@@ -1734,6 +1829,11 @@ function H.aimWatchSubject(subject, connections, state)
         if H.aimMetadataEvent(child) then dirty() end
     end, connections)
     if subject:IsA("Humanoid") then H.connect(subject:GetPropertyChangedSignal("Health"), dirty, connections) end
+    if subject:IsA("Humanoid") then H.connect(subject:GetPropertyChangedSignal("RootPart"), dirty, connections) end
+    if subject:IsA("BasePart") then
+        H.connect(subject:GetPropertyChangedSignal("CanQuery"), dirty, connections)
+        H.connect(subject:GetPropertyChangedSignal("Transparency"), dirty, connections)
+    end
     if subject:IsA("Player") then
         for _, name in ipairs({"Team", "Neutral", "Character"}) do
             H.connect(subject:GetPropertyChangedSignal(name), dirty, connections)
@@ -1761,7 +1861,7 @@ end
 function H.aimSameWatchScope(record)
     local state = S.aimWatchState
     if not state or not S.aimRecord or S.aimRecord.instance ~= record.instance
-        or state.root ~= record.root or state.humanoid ~= record.humanoid or state.player ~= record.player
+        or state.root ~= record.root or state.head ~= record.head or state.humanoid ~= record.humanoid or state.player ~= record.player
         or state.character ~= (S.context and S.context.character or player.Character) then return false end
     local current = record.instance.Parent
     for _, ancestor in ipairs(state.ancestors) do
@@ -1780,7 +1880,7 @@ function H.prepareAimSelection(record)
     S.aimRecord, S.aimTarget, S.aimRecordAt, S.aimDirty = record, record.instance, os.clock(), false
     local connections = {}
     local state = {seen = {}, sources = {}, cursor = 1, inspected = 0, ready = false,
-        root = record.root, humanoid = record.humanoid, player = record.player,
+        root = record.root, head = record.head, humanoid = record.humanoid, player = record.player,
         character = S.context and S.context.character or player.Character, ancestors = {}}
     S.aimWatchConnections, S.aimWatchState = connections, state
     H.connect(record.instance.DescendantAdded, function(descendant)
@@ -1793,7 +1893,7 @@ function H.prepareAimSelection(record)
     H.connect(record.instance.DescendantRemoving, function(descendant)
         if H.aimMetadataEvent(descendant) then S.aimDirty, S.aimTarget = true, nil end
     end, connections)
-    for _, subject in pairs({record.instance, record.root, record.humanoid, record.player,
+    for _, subject in pairs({record.instance, record.root, record.head, record.humanoid, record.player,
         player, S.context and S.context.character or player.Character, Workspace, game}) do
         H.aimWatchSubject(subject, connections, state)
     end
@@ -1855,20 +1955,26 @@ function H.aimCanUpdate()
 end
 
 function H.aimCheapRecord(record, origin)
-    if not record or not record.instance or not record.instance.Parent or not record.root or not record.root.Parent
-        or (record.root ~= record.instance and not record.root:IsDescendantOf(record.instance)) or not record.instance:IsDescendantOf(Workspace)
-        or not H.finiteVector(record.root.Position) then return nil end
-    if record.humanoid and (not record.humanoid.Parent or not H.finite(record.humanoid.Health)
+    if not record or not record.instance or not record.instance.Parent
+        or not record.instance:IsDescendantOf(Workspace) or not record.root or not record.root.Parent
+        or not record.root:IsA("BasePart") or not H.finiteVector(record.root.Position)
+        or (record.root ~= record.instance and not record.root:IsDescendantOf(record.instance))
+        or not record.head or not record.head.Parent or not record.head:IsA("BasePart")
+        or not H.finiteVector(record.head.Position) or record.head.CanQuery == false
+        or (record.head ~= record.instance and not record.head:IsDescendantOf(record.instance)) then return nil end
+    if record.humanoid and (record.humanoid.Parent ~= record.instance or not H.finite(record.humanoid.Health)
         or record.humanoid.Health <= 0) then return nil end
     if record.player and (record.player == player or record.player.Character ~= record.instance
         or (not player.Neutral and not record.player.Neutral and player.Team and player.Team == record.player.Team)) then return nil end
+    local maximum = 24
+    if H.finiteVector(record.root.Size) then maximum = math.max(maximum, math.min(120, record.root.Size.Magnitude * 2)) end
+    if (record.head.Position - record.root.Position).Magnitude > maximum then return nil end
     local range = H.finite(Config.AimRange) and Config.AimRange or 600
     local distance = (record.root.Position - origin).Magnitude
     if distance > range then return nil end
-    local position = record.root.Position
-    if record.head and record.head.Parent == record.instance and H.finiteVector(record.head.Position) then position = record.head.Position end
     return {instance = record.instance, root = record.root, humanoid = record.humanoid,
-        player = record.player, position = record.root.Position, aimPosition = position, distance = distance}
+        player = record.player, head = record.head, position = record.head.Position,
+        aimPosition = record.head.Position, distance = distance}
 end
 
 function H.nextCombatCandidate(index)
@@ -1900,8 +2006,6 @@ function H.updateAimWorker()
             {range = Config.AimRange, camera = true, allowPlayers = true})
         if record and H.aimScreenOffset(record, camera)
             and H.enemyVisible(record, camera.CFrame.Position, nil, true, nil, true) then
-            record.head = record.instance:IsA("Model") and record.instance:FindFirstChild("Head") or nil
-            if record.head and not record.head:IsA("BasePart") then record.head = nil end
             H.prepareAimSelection(record)
         else H.clearAimSelection() end
         index.lastTarget = now
@@ -1910,8 +2014,6 @@ function H.updateAimWorker()
         index.lastAcquire = now
         local record = H.pickAimTarget(camera.CFrame.Position, camera)
         if record then
-            record.head = record.instance:IsA("Model") and record.instance:FindFirstChild("Head") or nil
-            if record.head and not record.head:IsA("BasePart") then record.head = nil end
             H.prepareAimSelection(record)
         end
     end
@@ -3725,102 +3827,203 @@ function H.npcBounds(instance)
     return nil
 end
 
-function H.npcProximity(position)
-    -- Monster-only scanning is LOCAL and ON-DEMAND; no Workspace-wide index.
-    if not (S.flags.monster or S.hovering) or not S.context then
-        return math.huge, math.huge, -math.huge
+Config.NPCMaxLocalParts = 128
+Config.NPCQueryInterval = 0.12
+Config.NPCClassifyBudget = 6
+Config.NPCPartBudget = 32
+Config.NPCWorkSeconds = 0.001
+Config.NPCSnapshotMaxAge = 0.75
+Config.NPCEscapeRetryInterval = 0.25
+Config.NPCLandingRetryInterval = 0.25
+Config.NPCLandingProbes = 3
+Config.NPCPlacementMaxParts = 48
+
+function H.resetNPCSensor()
+    S.npcSensor, S.npcOverlap, S.npcPlacementOverlap = nil, nil, nil
+    S.npcNearbyIgnore = {}
+    S.npcLastScanAt, S.npcLastEscapeAttempt = -math.huge, -math.huge
+    S.npcLastLandingAttempt, S.npcLastLandingNotice = -math.huge, -math.huge
+    S.npcLandingCursor = 1
+end
+
+function H.stepNPCSensor(now)
+    if not S.flags.monster or not H.ready() or S.flags.lock or S.flying then return end
+    local ctx = S.context
+    local state = S.npcSensor
+    if not state or state.character ~= ctx.character then
+        H.resetNPCSensor()
+        state = {character = ctx.character, confirmed = {}, found = {}, seen = {}, parts = {},
+            cursor = 1, pending = false, limited = false, at = -math.huge,
+            queryAt = -math.huge, nextQuery = -math.huge, steppedAt = -math.huge}
+        S.npcSensor = state
     end
-    local overlap = S.npcOverlap
+    if now - state.steppedAt < Config.NPCScanInterval then return end
+    state.steppedAt = now
+    if not state.pending and now >= state.nextQuery then
+        local overlap = S.npcOverlap
+        if not overlap then
+            overlap = OverlapParams.new()
+            overlap.FilterType = Enum.RaycastFilterType.Exclude
+            S.npcOverlap = overlap
+        end
+        overlap.MaxParts = Config.NPCMaxLocalParts
+        overlap.FilterDescendantsInstances = {ctx.character}
+        local position = ctx.root.Position
+        local radius = S.hovering and Config.NPCScanRadius or (Config.NPCStartDistance + 2)
+        local center = S.hovering and position - Vector3.new(0, Config.NPCLiftHeight * 0.5, 0) or position
+        state.parts = Workspace:GetPartBoundsInRadius(center, radius, overlap)
+        state.cursor, state.found, state.seen = 1, {}, {}
+        state.pending, state.limited = true, #state.parts >= Config.NPCMaxLocalParts
+        state.origin, state.hovered, state.queryAt = position, S.hovering, now
+        state.center, state.radius = center, radius
+    end
+    if not state.pending then return end
+    local deadline = os.clock() + Config.NPCWorkSeconds
+    local inspected, classified = 0, 0
+    while state.cursor <= #state.parts and inspected < Config.NPCPartBudget
+        and classified < Config.NPCClassifyBudget and os.clock() < deadline do
+        local part = state.parts[state.cursor]
+        state.cursor += 1
+        inspected += 1
+        if part and part.Parent and part:IsA("BasePart") and part:IsDescendantOf(Workspace)
+            and not part:IsDescendantOf(ctx.character) and not state.seen[part] then
+            state.seen[part] = true
+            classified += 1
+            if H.hostileNPC(part) then
+                state.found[#state.found + 1] = {part = part, parent = part.Parent, at = now}
+            end
+        end
+    end
+    if state.cursor > #state.parts then
+        state.confirmed, state.found = state.found, {}
+        state.parts, state.seen = {}, {}
+        state.pending, state.at = false, state.queryAt
+        state.nextQuery = now + Config.NPCQueryInterval
+    end
+end
+
+function H.npcSensorSummary()
+    if not S.flags.monster then return nil end
+    if not H.ready() then return "Waiting for a living character" end
+    local state = S.npcSensor
+    if not state then return "Preparing bounded local scan" end
+    local complete = not state.pending and not state.limited and state.origin ~= nil
+        and state.hovered == S.hovering and os.clock() - state.at <= Config.NPCSnapshotMaxAge
+        and (S.context.root.Position - state.origin).Magnitude <= 8
+    if state.limited then return S.hovering and "Scan limited; holding safe height" or "Local scan limited in dense area" end
+    if not complete then return S.hovering and "Checking nearby monsters; holding height" or "Checking nearby monsters" end
+    return nil
+end
+
+function H.npcSafeDestination(target)
+    if not H.ready() or not H.finiteVector(target.Position)
+        or target.Position.Y <= Workspace.FallenPartsDestroyHeight + 8 then return false end
+    local ctx = S.context
+    local clearanceHeight = math.max(3.8, ctx.humanoid.HipHeight + ctx.root.Size.Y + 1)
+    local clearance = Vector3.new(math.max(2.6, ctx.root.Size.X + 0.5),
+        clearanceHeight, math.max(2.6, ctx.root.Size.Z + 0.5))
+    local overlap = S.npcPlacementOverlap
     if not overlap then
         overlap = OverlapParams.new()
         overlap.FilterType = Enum.RaycastFilterType.Exclude
-        overlap.MaxParts = Config.NPCMaxLocalParts
-        S.npcOverlap = overlap
+        S.npcPlacementOverlap = overlap
     end
-    overlap.FilterDescendantsInstances = {S.context.character}
-    -- A narrow, uncapped query avoids missing a monster behind hundreds of map parts.
-    -- This changes scan cost, NOT the 15-stud activation distance.
-    local radius = S.hovering and Config.NPCScanRadius or (Config.NPCStartDistance + 2)
-    overlap.MaxParts = S.hovering and Config.NPCMaxLocalParts or 0
-    -- During a 15-stud hover, include nearby ground-level worm segments.
-    local center = position
-    if S.hovering then center = position - Vector3.new(0, Config.NPCLiftHeight * 0.5, 0) end
-    local parts = Workspace:GetPartBoundsInRadius(center, radius, overlap)
-    local nearest3D, nearestXZ, highestTop = math.huge, math.huge, -math.huge
-    local excluded, seen, classified, excludedOwner = {}, {}, {}, {}
+    overlap.FilterDescendantsInstances = {ctx.character}
+    overlap.MaxParts = Config.NPCPlacementMaxParts
+    overlap.RespectCanCollide = true
+    local parts = Workspace:GetPartBoundsInBox(target, clearance * 0.92, overlap)
     for _, part in ipairs(parts) do
-        if part:IsA("BasePart") and not seen[part] then
-            seen[part] = true
-            local owner = part:FindFirstAncestorOfClass("Model") or part.Parent
-            if owner == Workspace or owner == nil then owner = part end
-            local hostile = classified[owner]
-            if hostile == nil then
-                hostile = not H.npcExcluded(part) and H.hostileNPC(part)
-                classified[owner] = hostile
-            end
-            if hostile then
+        if part.CanCollide then return false end
+    end
+    if #parts >= Config.NPCPlacementMaxParts then return false end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {ctx.character}
+    params.RespectCanCollide = true
+    for _, axis in ipairs({target.RightVector * clearance.X * 0.45,
+        target.UpVector * clearance.Y * 0.45, target.LookVector * clearance.Z * 0.45}) do
+        local hit = Workspace:Raycast(target.Position - axis, axis * 2, params)
+        if hit and hit.Instance:IsA("Terrain") then return false end
+    end
+    return H.findHazard(target.Position, Vector3.zero, false) == nil
+end
+
+function H.npcProximity(position)
+    if not (S.flags.monster or S.hovering) or not H.ready() then
+        return math.huge, math.huge, -math.huge, false
+    end
+    local state = S.npcSensor
+    if not state or state.character ~= S.context.character then
+        return math.huge, math.huge, -math.huge, false
+    end
+    local now = os.clock()
+    local nearest3D, nearestXZ, highestTop = math.huge, math.huge, -math.huge
+    local seen, exclusions = {}, {}
+    for _, records in ipairs({state.confirmed, state.found}) do
+        for _, record in ipairs(records) do
+            local part = record.part
+            if not seen[part] and part.Parent == record.parent and part:IsDescendantOf(Workspace)
+                and now - record.at <= Config.NPCSnapshotMaxAge then
+                seen[part] = true
                 local bounds, size = part.CFrame, part.Size
                 local half = H.npcExtents(bounds, size)
                 local offset = position - bounds.Position
                 local flat = Vector3.new(math.max(0, math.abs(offset.X) - half.X), 0,
                     math.max(0, math.abs(offset.Z) - half.Z)).Magnitude
-                local distance = H.boxDistance(position, bounds, size)
-                nearest3D = math.min(nearest3D, distance)
+                nearest3D = math.min(nearest3D, H.boxDistance(position, bounds, size))
                 nearestXZ = math.min(nearestXZ, flat)
                 if flat <= Config.NPCStopDistance then
                     highestTop = math.max(highestTop, bounds.Position.Y + half.Y)
                 end
-                -- Ignore the actual NPC rig when raycasting to find safe ground.
-                if not excludedOwner[owner] then
-                    table.insert(excluded, owner)
-                    excludedOwner[owner] = true
-                end
+                exclusions[#exclusions + 1] = part
             end
         end
     end
-    S.npcNearbyIgnore = excluded
-    return nearest3D, nearestXZ, highestTop
+    S.npcNearbyIgnore = exclusions
+    local complete = not state.pending and not state.limited and state.origin ~= nil
+        and state.hovered == S.hovering and now - state.at <= Config.NPCSnapshotMaxAge
+        and (S.context.root.Position - state.origin).Magnitude <= 8
+        and state.center ~= nil and (position - state.center).Magnitude
+            + math.max(Config.NPCStartDistance, Config.NPCStopDistance) <= state.radius
+    return nearest3D, nearestXZ, highestTop, complete
 end
 
 function H.npcEscapeTarget(minimumY)
     local root = S.context.root
     for _, extra in ipairs({0, 3, 7, 12, 20}) do
         local target = root.CFrame + Vector3.new(0, minimumY + extra - root.Position.Y, 0)
-        -- This is a teleport: a ceiling along the old path must not block a clear
-        -- destination above it. The active skywalk owns noclip for the character.
-        if H.safeDestination(target) then return target end
+        if H.npcSafeDestination(target) then return target end
     end
     return nil
 end
 
 function H.npcLandingAt(target)
     if not H.ready() then return nil end
+    local _, _, _, complete = H.npcProximity(target.Position)
+    if not complete then return nil end
     local ctx = S.context
-    -- Refresh actual local monster geometry before choosing any landing spot.
-    H.npcProximity(target.Position)
     local exclusions = {ctx.character}
-    for _, instance in ipairs(S.npcNearbyIgnore) do table.insert(exclusions, instance) end
+    for _, instance in ipairs(S.npcNearbyIgnore) do exclusions[#exclusions + 1] = instance end
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
     params.FilterDescendantsInstances = exclusions
     params.RespectCanCollide = true
     local orientation = target - target.Position
     local height = math.max(3, ctx.humanoid.HipHeight + ctx.root.Size.Y * 0.5 + 0.25)
-    -- Try immediately beneath the character first. An edge, prop or sloped
-    -- ledge must not strand Sky Walk in midair when clear ground is close by.
-    local offsets = {Vector3.zero,
-        Vector3.new(4, 0, 0), Vector3.new(-4, 0, 0),
-        Vector3.new(0, 0, 4), Vector3.new(0, 0, -4),
-        Vector3.new(8, 0, 0), Vector3.new(-8, 0, 0),
-        Vector3.new(0, 0, 8), Vector3.new(0, 0, -8)}
-    for _, offset in ipairs(offsets) do
-        local hit = Workspace:Raycast(target.Position + offset + Vector3.new(0, 2, 0),
+    local offsets = {Vector3.zero, Vector3.new(4, 0, 0), Vector3.new(-4, 0, 0),
+        Vector3.new(0, 0, 4), Vector3.new(0, 0, -4), Vector3.new(8, 0, 0),
+        Vector3.new(-8, 0, 0), Vector3.new(0, 0, 8), Vector3.new(0, 0, -8)}
+    local start = S.npcLandingCursor or 1
+    for step = 1, Config.NPCLandingProbes do
+        local index = ((start + step - 2) % #offsets) + 1
+        S.npcLandingCursor = (index % #offsets) + 1
+        local hit = Workspace:Raycast(target.Position + offsets[index] + Vector3.new(0, 2, 0),
             Vector3.new(0, -Config.NPCLandingDepth, 0), params)
         if hit and hit.Normal.Y >= 0.5 then
             local result = CFrame.new(hit.Position + Vector3.new(0, height, 0)) * orientation
-            local distance, flat = H.npcProximity(result.Position)
-            if distance > Config.NPCStartDistance and flat > Config.NPCStopDistance
-                and H.safeDestination(result) then return result end
+            local distance, flat, _, covered = H.npcProximity(result.Position)
+            if covered and distance > Config.NPCStartDistance and flat > Config.NPCStopDistance
+                and H.npcSafeDestination(result) then return result end
         end
     end
     return nil
@@ -3831,9 +4034,12 @@ function H.updateNPCs()
     local position, now = S.context.root.Position, os.clock()
     if now - S.npcLastScanAt < Config.NPCScanInterval then return end
     S.npcLastScanAt = now
-    local closest3D, closestXZ, highestTop = H.npcProximity(position)
+    H.stepNPCSensor(now)
+    local closest3D, closestXZ, highestTop, complete = H.npcProximity(position)
     if not S.hovering then
-        if closest3D <= Config.NPCStartDistance then
+        if closest3D <= Config.NPCStartDistance
+            and now - (S.npcLastEscapeAttempt or -math.huge) >= Config.NPCEscapeRetryInterval then
+            S.npcLastEscapeAttempt = now
             local target = H.npcEscapeTarget(math.max(position.Y + Config.NPCLiftHeight,
                 highestTop + Config.NPCClearanceHeight))
             if target and H.startMover("hover", target) then
@@ -3845,11 +4051,11 @@ function H.updateNPCs()
             end
         end
     elseif closestXZ <= Config.NPCStopDistance then
-        -- Track the worm below without a vertical cutoff; gaining altitude does
-        -- not mean the same body underneath is safe to land on.
         S.hoverQuietSince = nil
         if highestTop + Config.NPCClearanceHeight > S.hoverY
-            and now - S.lastNPCLift >= Config.NPCLiftCooldown then
+            and now - S.lastNPCLift >= Config.NPCLiftCooldown
+            and now - (S.npcLastEscapeAttempt or -math.huge) >= Config.NPCEscapeRetryInterval then
+            S.npcLastEscapeAttempt = now
             local target = H.npcEscapeTarget(highestTop + Config.NPCClearanceHeight)
             if target and H.moveRoot(target) then
                 S.hoverY, S.lastNPCLift = target.Position.Y, now
@@ -3857,17 +4063,11 @@ function H.updateNPCs()
                 H.zeroRigVelocity()
             end
         end
-    else
-        -- Immediately try a verified landing once the monster leaves the
-        -- horizontal danger radius. Avoid a second hold/quiet countdown.
-        -- Retry promptly if ground was temporarily blocked, without busy-looping raycasts.
-        if now - (S.npcLastLandingAttempt or -math.huge) >= 0.06 then
-            S.npcLastLandingAttempt = now
-            if not H.endHover(true, true)
-                and now - (S.npcLastLandingNotice or -math.huge) >= 2 then
-                S.npcLastLandingNotice = now
-                H.notice("Anti-Monster: waiting for clear, safe ground", 2)
-            end
+    elseif complete and now - (S.npcLastLandingAttempt or -math.huge) >= Config.NPCLandingRetryInterval then
+        S.npcLastLandingAttempt = now
+        if not H.endHover(true, true) and now - (S.npcLastLandingNotice or -math.huge) >= 2 then
+            S.npcLastLandingNotice = now
+            H.notice("Anti-Monster: waiting for clear, safe ground", 2)
         end
     end
 end
@@ -5028,23 +5228,29 @@ function H.pickAimTarget(origin, camera)
     local index, now = H.combatIndexState(), os.clock()
     local deadline, inspected, sight = now + 0.0015, 0, 0
     local best, bestScore, seen = nil, nil, {}
+    local info = {at = now, eligible = 0, offscreen = 0, blocked = 0, visible = 0}
     while inspected < math.min(#index.objects, 6) and sight < 2 and os.clock() < deadline do
         local instance = H.nextCombatCandidate(index)
         inspected += 1
         local record = H.enemyRecord(instance, origin, {range = math.max(Config.AimRange, Config.BulletRange), allowPlayers = true})
         if record and not seen[record.root] then
             seen[record.root] = true
+            info.eligible += 1
             if S.flags.bullet then H.rememberShotCandidate(record, now) end
             if camera and record.distance <= Config.AimRange then
                 local offset = H.aimScreenOffset(record, camera)
                 local score = offset and offset + record.distance * 0.01
+                if not offset then info.offscreen += 1 end
                 if score and (not bestScore or score < bestScore) and sight < 2 then
                     sight += 1
-                    if H.enemyVisible(record, origin, nil, true, nil, true) then best, bestScore = record, score end
+                    if H.enemyVisible(record, origin, nil, true, nil, true) then
+                        best, bestScore, info.visible = record, score, info.visible + 1
+                    else info.blocked += 1 end
                 end
             end
         end
     end
+    if camera then index.aimDiagnostics = info end
     index.lastCandidateCount, index.lastSightCount = inspected, sight
     return best
 end
@@ -5844,11 +6050,12 @@ function H.setToggle(key, enabled)
             if enabled then H.notice("Flight armed: double-tap jump to fly", 4) end
         elseif key == "monster" then
             if enabled then
-                S.npcLastScanAt, S.lastNPCLift = -math.huge, -math.huge
-                S.npcOverlap = nil
+                if H.resetNPCSensor then H.resetNPCSensor() end
+                S.lastNPCLift = -math.huge
                 H.updateNPCs()
             else
                 H.endHover(true)
+                if H.resetNPCSensor then H.resetNPCSensor() end
                 S.npcOverlap, S.npcNearbyIgnore = nil, {}
             end
         elseif key == "trap" then
@@ -5911,6 +6118,7 @@ function H.setToggle(key, enabled)
         elseif key == "noclip" then H.release("noclip")
         elseif key == "trap" then H.releaseAntiTrap()
         elseif key == "flight" or key == "monster" then H.stopMover()
+            if key == "monster" and H.resetNPCSensor then H.resetNPCSensor() end
         elseif key == "fling" then H.releaseFlingHold(); H.release("fling")
         elseif key == "jump" then H.release("jump")
         elseif key == "aim" then H.stopAim()
@@ -5929,6 +6137,7 @@ function H.setToggle(key, enabled)
 end
 
 function H.cleanupCharacter()
+    if H.resetNPCSensor then H.resetNPCSensor() end
     H.afkBreak("RESPAWNING")
     H.afkStopPulse()
     S.idleGroundParams,S.afkSupport,S.afkRecovery,S.afkHolding=nil,nil,nil,false
