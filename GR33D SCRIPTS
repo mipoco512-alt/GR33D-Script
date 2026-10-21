@@ -1,4 +1,4 @@
--- GR33D Panel v7.27: prioritized moving-hazard sensing + persistent threat hold
+-- GR33D Panel v7.29: fast hazards + repeatable low-HP spawn TP + pre/post physics fling protection
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -134,6 +134,13 @@ local Config = {
     FlingStationaryMaxSpeed = 4.5,
     FlingStationaryMaxVertical = 7,
     FlingGroundSnapshotAge = 0.55,
+    -- Position Lock has its OWN fling monitor. The ordinary anti-fling controller
+    -- intentionally yields to Position Lock, so protect that mode pre/post physics.
+    RingGuardSnapshotMaxAge = 0.25,
+    RingGuardMaxRestoreDistance = 750, -- cap unexpected client position corrections
+    RingGuardUnauthorizedStep = 14, -- last trusted pose guard (not regular walking)
+    RingGuardNoticeInterval = 1.0,
+    RingGuardImpulseRepeatGrace = 0.12,
     FlingInputReleaseGrace = 0.30,
     SafePositionMaxAge = 3,
     FallSpeedLimit = 45,
@@ -251,6 +258,9 @@ local S = {
     flingHoldTarget = nil, flingPauseUntil = -math.huge, flingInputUntil = -math.huge,
     flingSnapshot = nil, flingLastStableCF = nil, flingLastStableAt = -math.huge,
     flingRecovering = false,
+    ringGuardSnapshot = nil, ringGuardTrusted = nil, ringGuardTrustedAt = -math.huge,
+    ringGuardLastNotice = -math.huge, ringGuardLastHit = -math.huge,
+    ringGuardRecovering = false,
     manualTeleportUntil = -math.huge, manualTeleportLastTarget = nil,
     lockSuspended = false, escapeHold = nil, lastEscapeDriftCorrection = -math.huge,
     lastChaseRelocate = -math.huge, lastChaseThreatAt = -math.huge,
@@ -268,10 +278,19 @@ local S = {
     observerBest = nil, spectateCameraSaved = false, spectateLastRefresh = -math.huge,
 }
 local H = {}
+-- Repeatable 30% HP spawn return: no lifetime "triggered" latch.
+-- A new trigger is allowed after healing above 30%, or when the character
+-- remains below the threshold but has moved away from its last spawn arrival.
 Config.AutoSpawnTPThreshold = 0.30
-Config.AutoSpawnTPRetrySeconds = 2
-Config.AutoSpawnTPMaxAttempts = 3
-S.autoSpawnTP = {character = nil, triggered = false, attempts = 0, retryAt = -math.huge}
+Config.AutoSpawnTPRetrySeconds = 1.25
+Config.AutoSpawnTPMaxRetrySeconds = 4.0
+Config.AutoSpawnTPArrivalRadius = 13
+Config.AutoSpawnTPMaxAttempts = 3 -- notification cadence, NOT a permanent limit
+local function newAutoSpawnTPState(character)
+    return {character = character, attempts = 0, retryAt = -math.huge,
+        lastTarget = nil, lastRequestAt = -math.huge, belowThreshold = false}
+end
+S.autoSpawnTP = newAutoSpawnTPState(nil)
 for _, key in ipairs({"flight", "health", "lowhp", "spectate", "fall", "noclip", "fling", "trap", "run", "jump", "lock", "monster", "afk", "aim", "bullet", "watch"}) do
     S.flags[key] = false
 end
@@ -3192,6 +3211,7 @@ function H.beginEscapeMove(target, mode, home, reason)
     H.releaseIdle(true)
     H.releaseFlingHold(Config.IdleInputGrace)
     S.flingSnapshot = nil
+    H.ringGuardReset()
     local ok, held = pcall(function()
         H.suspendLock() -- release anchors BEFORE moving the model
         if not H.moveRoot(target) then return false end
@@ -3297,6 +3317,7 @@ function H.stopLock(tryLanding)
     if landing then H.moveRoot(landing) end
     S.lockSuspended = false
     S.lockTarget, S.escape = nil, nil
+    H.ringGuardReset()
     H.resetLockWalking()
     S.defenseMotion, S.defenseMotionSlots, S.defenseHazardRecords = nil, nil, nil
     S.defenseHazardCursor, S.defenseQueries, S.defenseDetection = nil, nil, nil
@@ -3438,15 +3459,15 @@ function H.updateLockWalking(deltaTime)
             or angular.Magnitude > Config.FlingAngularThreshold
             or (velocity.Y > math.max(Config.FlingLinearThreshold, jumpPower + 35)
                 and velocity.Y - previousVelocity.Y > Config.FlingImpulseDeltaThreshold)
-        if impulse then H.zeroRigVelocity(); velocity = Vector3.zero end
-    end
-    if correction and now - (S.lockWalkRejectedAt or -math.huge) >= Config.DefenseCorrectionCooldown then
-        H.zeroRigVelocity()
-        H.recoverRagdoll()
-        H.moveRoot(previous.pose)
-        velocity = Vector3.zero
-        S.lockWalkRejectedAt = now
-        H.logEvent("Position guard", "Large unexplained displacement; normal movement remains enabled")
+        if impulse or correction then
+            -- Never adopt the position reached by a sudden push as our new lock.
+            -- This recovery has no 0.75s cooldown; repeated impulses get assessed
+            -- every simulation step. Notices are rate-limited in ringGuardRestore.
+            local recovered = H.ringGuardRestore(impulse and "abnormal fling impulse"
+                or "external displacement", previous.pose)
+            if not recovered then H.zeroRigVelocity() end
+            return moving
+        end
     end
     S.lockTarget = root.CFrame
     S.lockWalking = moving
@@ -4444,11 +4465,169 @@ function H.markOwnTeleport(target)
     S.manualTeleportUntil = now + Config.ManualTeleportGrace
     S.manualTeleportLastTarget = target
     S.flingSnapshot = nil
+    H.ringGuardReset()
     S.flingLastStableCF = target
     S.flingLastStableAt = now
     H.releaseFlingHold(Config.ManualTeleportGrace)
     H.releaseIdle(true)
     S.idleBlockedUntil = math.max(S.idleBlockedUntil, S.manualTeleportUntil)
+end
+
+-- Position Lock super-ring fling guard (client-side best effort, not server immunity).
+-- Deliberately does not anchor the walking character. It only rejects evidently
+-- abnormal velocity / displacement, and never overrides an ongoing escape/TP.
+function H.ringGuardReset()
+    S.ringGuardSnapshot = nil
+    S.ringGuardTrusted = nil
+    S.ringGuardTrustedAt = -math.huge
+    S.ringGuardRecovering = false
+end
+
+function H.ringGuardCanOperate()
+    if not (S.flags.lock and H.ready()) then return false end
+    local ctx, now = S.context, os.clock()
+    return not S.escape and not S.lockSuspended and not S.manualMove
+        and not S.mover and not S.flying and not S.hovering
+        and now >= (S.manualTeleportUntil or -math.huge)
+        and now >= (S.runExternalCorrectionUntil or -math.huge)
+        and not ctx.root.Anchored and not ctx.humanoid.Sit
+        and not ctx.humanoid.SeatPart
+        and ctx.character:GetAttribute("ProtectionAllowHighVelocity") ~= true
+end
+
+function H.ringGuardEvidence(ctx, previous, dt)
+    local root, humanoid = ctx.root, ctx.humanoid
+    local linear, angular = root.AssemblyLinearVelocity, root.AssemblyAngularVelocity
+    if not H.finiteVector(linear) or not H.finiteVector(angular) then
+        return "invalid velocity"
+    end
+    if not H.flingVelocityAllowed(linear, ctx) or angular.Magnitude > Config.FlingAngularThreshold then
+        return "extreme root physics"
+    end
+    -- A held object can impart a severe spin to a limb before the root reacts.
+    for _, part in ipairs(ctx.character:GetChildren()) do
+        if part:IsA("BasePart") and BODY_PART_NAMES[part.Name] then
+            local v, w = part.AssemblyLinearVelocity, part.AssemblyAngularVelocity
+            if not H.finiteVector(v) or not H.finiteVector(w)
+                or not H.flingVelocityAllowed(v, ctx)
+                or w.Magnitude > Config.FlingAngularThreshold then
+                return "extreme limb physics"
+            end
+        end
+    end
+    if previous and previous.root == root and typeof(previous.pose) == "CFrame" then
+        local frame = H.finite(dt) and math.clamp(dt, 1/240, 0.12) or 1/60
+        local before = previous.velocity
+        if H.finiteVector(before) then
+            local dv = (linear - before).Magnitude
+            local moving = H.flingMovementInput(ctx)
+            local limit = moving and Config.FlingMovingImpulseThreshold
+                or Config.FlingImpulseDeltaThreshold
+            if dv > limit and not H.isAuthorizedJumpImpulse(ctx, linear, before)
+                and not humanoid.Jump then
+                return "sudden physical impulse"
+            end
+            if not H.flingDisplacementAllowed(ctx, root.Position - previous.pose.Position,
+                linear, before, frame) then
+                return "unexpected displacement"
+            end
+        end
+    end
+    return nil
+end
+
+function H.ringGuardRestore(reason, preferred)
+    if not H.ringGuardCanOperate() or S.ringGuardRecovering then return false end
+    S.ringGuardRecovering = true
+    local ok, restored = pcall(function()
+        local ctx, now = S.context, os.clock()
+        H.zeroRigVelocity()
+        H.recoverRagdoll()
+        local candidate = preferred
+        if typeof(candidate) ~= "CFrame" or not H.finiteVector(candidate.Position) then
+            candidate = S.ringGuardTrusted
+        end
+        if candidate == nil and S.lockWalkSample then
+            candidate = S.lockWalkSample.pose
+        end
+        local moved = false
+        if typeof(candidate) == "CFrame" and H.finiteVector(candidate.Position)
+            and (ctx.root.Position - candidate.Position).Magnitude <= Config.RingGuardMaxRestoreDistance
+            and H.safeDestination(candidate) then
+            moved = H.moveRoot(candidate)
+        end
+        -- Do not update a trusted pose or target with the attacked position.
+        if moved then
+            S.lockTarget = candidate
+            S.lockWalkSample = {at = now, root = ctx.root, pose = candidate,
+                velocity = Vector3.zero}
+            S.lockWalkVelocity = Vector3.zero
+            S.ringGuardTrusted = candidate
+            S.ringGuardTrustedAt = now
+        else
+            S.lockWalkSample = nil -- force a fresh sample after the next stable physics step
+        end
+        S.ringGuardSnapshot = nil
+        S.ringGuardLastHit = now
+        if now - (S.ringGuardLastNotice or -math.huge) >= Config.RingGuardNoticeInterval then
+            S.ringGuardLastNotice = now
+            H.logEvent("Anti-fling", "Position Lock rejected " .. tostring(reason)
+                .. (moved and "; restored a prior clear pose" or "; velocity neutralized"))
+            H.notice("Anti-Fling: " .. tostring(reason)
+                .. (moved and " recovered" or " stopped locally"), 2, 85)
+        end
+        return moved
+    end)
+    S.ringGuardRecovering = false
+    if not ok then H.report("Position Lock anti-fling", restored) end
+    return ok and restored == true
+end
+
+function H.guardLockImpulse(phase, deltaTime)
+    if not H.ringGuardCanOperate() then
+        S.ringGuardSnapshot = nil
+        return false
+    end
+    local ctx, root, now = S.context, S.context.root, os.clock()
+    if phase == "pre" then
+        -- Compare with a trusted post-physics pose to catch zero-velocity CFrame
+        -- pushes that occurred between successive frames.
+        local last = S.ringGuardTrusted
+        if last and now - S.ringGuardTrustedAt <= Config.RingGuardSnapshotMaxAge
+            and (root.Position - last.Position).Magnitude > Config.RingGuardUnauthorizedStep then
+            local velocity = root.AssemblyLinearVelocity
+            local allowance = H.finiteVector(velocity)
+                and math.max(Config.RingGuardUnauthorizedStep,
+                    velocity.Magnitude * (now - S.ringGuardTrustedAt) * 2 + 6)
+                or Config.RingGuardUnauthorizedStep
+            if (root.Position - last.Position).Magnitude > allowance then
+                H.ringGuardRestore("unexpected CFrame push", last)
+                return true
+            end
+        end
+        local reason = H.ringGuardEvidence(ctx, nil, deltaTime)
+        if reason then
+            H.ringGuardRestore(reason, last or S.lockTarget)
+            return true
+        end
+        S.ringGuardSnapshot = {root = root, pose = root.CFrame,
+            velocity = root.AssemblyLinearVelocity, at = now}
+    else
+        local previous = S.ringGuardSnapshot
+        S.ringGuardSnapshot = nil
+        if previous and previous.root == root
+            and now - previous.at <= Config.RingGuardSnapshotMaxAge then
+            local reason = H.ringGuardEvidence(ctx, previous, deltaTime)
+            if reason then
+                H.ringGuardRestore(reason, previous.pose)
+                return true
+            end
+            -- Only accept a position after it survives the post-physics tests.
+            S.ringGuardTrusted = root.CFrame
+            S.ringGuardTrustedAt = now
+        end
+    end
+    return false
 end
 
 function H.updateFling(phase, deltaTime)
@@ -4952,12 +5131,15 @@ function H.updateManualMovement(deltaTime)
     return true
 end
 
-function H.teleport(target, label)
+function H.teleport(target, label, options)
     if not H.ready() or typeof(target) ~= "CFrame" or not H.finiteVector(target.Position) then
         H.notice("Teleport failed: character or destination unavailable",4)
         return false
     end
-    if S.escape and S.escape.mode ~= "manual" then
+    -- Critical HP takes precedence over a previous local dodge or manual move.
+    -- Ordinary manual teleport buttons keep their original priority rules.
+    local lowHP = type(options) == "table" and options.lowHP == true
+    if S.escape and S.escape.mode ~= "manual" and not lowHP then
         H.notice("Teleport waiting: emergency defense currently owns movement",4)
         return false
     end
@@ -4973,7 +5155,8 @@ function H.teleport(target, label)
     local ctx = S.context
     local origin = ctx.root.CFrame
     local distance = (chosen.Position-origin.Position).Magnitude
-    local smooth = distance <= 72
+    -- Low-health return must not spend up to 1.8 seconds walking a smooth route.
+    local smooth = not lowHP and distance <= 72
     if smooth and not H.manualPathClear(origin,chosen) then
         H.notice("Teleport blocked: nearby route is obstructed or unsupported",5)
         return false
@@ -4991,6 +5174,10 @@ function H.teleport(target, label)
         H.release("run")
         S.runCommandSpeed,S.runAppliedSpeed = nil,nil
         H.stopEscapeHold()
+        if lowHP and S.escape then
+            -- The emergency controller must not pull us back to the hazard.
+            S.escape = nil
+        end
         H.suspendLock()
         H.markOwnTeleport(chosen)
         S.manualTeleportUntil = os.clock()+duration+1.2
@@ -5049,7 +5236,7 @@ function H.spawnRootTarget(spawn)
 end
 
 -- Auto and manual spawn actions share the exact same validated destination/routine.
-function H.tpToEntrySpawn(label)
+function H.tpToEntrySpawn(label, options)
     if not H.ready() then
         H.notice("Wait for a living character", 3)
         return false
@@ -5060,42 +5247,74 @@ function H.tpToEntrySpawn(label)
         H.notice("Join spawn unknown; run at join or use a SpawnLocation", 5)
         return false
     end
-    return H.teleport(target, label or "entry spawn") == true
+    return H.teleport(target, label or "entry spawn", options) == true
 end
 
 function H.tryAutoSpawnTP(reportedHealth)
     if not S.flags.lowhp or not H.ready() then return false end
     local ctx = S.context
     local humanoid = ctx.humanoid
-    local health = type(reportedHealth) == "number" and reportedHealth or humanoid.Health
-    local maxHealth = humanoid.MaxHealth
-    if not H.finite(health) or not H.finite(maxHealth)
-        or maxHealth <= 0 or health <= 0
-        or health > maxHealth * Config.AutoSpawnTPThreshold then return false end
+    local health, maximum = humanoid.Health, humanoid.MaxHealth
+    -- HealthChanged can arrive between replication and the next Heartbeat. If
+    -- it reports a lower finite value, react to that immediately.
+    if H.finite(reportedHealth) and reportedHealth > 0 then
+        health = math.min(health, reportedHealth)
+    end
+    if not H.finite(health) or not H.finite(maximum) or maximum <= 0 or health <= 0 then
+        return false
+    end
 
     local state = S.autoSpawnTP
-    if state.character ~= ctx.character then
-        state = {character = ctx.character, triggered = false, attempts = 0, retryAt = -math.huge}
+    if not state or state.character ~= ctx.character then
+        state = newAutoSpawnTPState(ctx.character)
         S.autoSpawnTP = state
     end
-    if state.triggered or os.clock() < state.retryAt then return false end
-    -- The existing teleport routine already checks collision and gives way to
-    -- emergency/other movement controllers; retry when they finish.
-    if S.manualMove or (S.escape and S.escape.mode ~= "manual") then return false end
+    local now = os.clock()
+    local threshold = maximum * Config.AutoSpawnTPThreshold
+    if health > threshold then
+        -- Automatically rearm for the NEXT drop on the SAME living character.
+        state.belowThreshold = false
+        state.attempts = 0
+        state.retryAt = -math.huge
+        return false
+    end
+    state.belowThreshold = true
 
-    state.attempts += 1
-    state.retryAt = os.clock() + Config.AutoSpawnTPRetrySeconds
-    local success = H.tpToEntrySpawn("auto spawn (30% HP)")
+    -- Do not repeatedly teleport an already-arrived player at low HP.
+    -- Remaining below 30% does not permanently disarm protection: after
+    -- moving away from spawn it can return again (subject to cooldown).
+    if state.lastTarget and
+        (ctx.root.Position - state.lastTarget.Position).Magnitude <= Config.AutoSpawnTPArrivalRadius then
+        state.attempts = 0
+        return false
+    end
+    -- Let an earlier spawn request finish its short observation period.
+    if S.manualMove and S.manualMove.label == "auto spawn (30% HP)" then
+        return false
+    end
+    if now < state.retryAt then return false end
+
+    -- Set retry time BEFORE the request, so an exception never causes the
+    -- Heartbeat callback to repeat it every frame.
+    state.retryAt = now + Config.AutoSpawnTPRetrySeconds
+    state.lastRequestAt = now
+    local success = H.tpToEntrySpawn("auto spawn (30% HP)", {lowHP = true})
     if success then
-        state.triggered = true
-        H.logEvent("Auto spawn TP", ("Triggered at %.1f / %.1f HP"):format(health, maxHealth))
-        H.notice("Low HP: spawn teleport requested", 4, 80)
+        state.lastTarget = S.manualMove and S.manualMove.target or state.lastTarget
+        state.attempts = 0
+        -- A failed/rolled-back client move is eligible for another attempt.
+        state.retryAt = now + Config.AutoSpawnTPRetrySeconds
+        H.logEvent("Auto spawn TP", ("Requested at %.2f / %.2f HP (%.1f%%)")
+            :format(health, maximum, health / maximum * 100))
+        H.notice("Low HP: immediate spawn return requested", 3, 85)
         return true
     end
-    if state.attempts >= Config.AutoSpawnTPMaxAttempts then
-        state.triggered = true -- prevent repeating failed requests forever
-        H.notice("Auto TP paused until respawn or rearm", 5, 80,
-            "Could not find a usable spawn after 3 requests")
+    state.attempts += 1
+    state.retryAt = now + math.min(Config.AutoSpawnTPMaxRetrySeconds,
+        Config.AutoSpawnTPRetrySeconds + (state.attempts - 1) * 0.65)
+    if state.attempts == 1 or state.attempts % Config.AutoSpawnTPMaxAttempts == 0 then
+        H.logEvent("Auto spawn TP", "Spawn request failed; retrying while HP remains low")
+        H.notice("Low HP: spawn unavailable; automatic retry armed", 3, 80)
     end
     return false
 end
@@ -6452,6 +6671,7 @@ function H.setToggle(key, enabled)
                 S.lockSuspended = false
                 S.lockMaintenanceAt, S.lockLocalScanAt = -math.huge, -math.huge
                 H.resetLockWalking()
+                H.ringGuardReset()
                 S.lockTarget, S.escape, S.lastEscape = S.context.root.CFrame, nil, -math.huge
                 S.lastChaseRelocate, S.lastChaseThreatAt = -math.huge, -math.huge
                 S.escapeHistory = {}
@@ -6507,16 +6727,13 @@ function H.setToggle(key, enabled)
                 H.notice("Health regeneration enabled; server controls actual HP", 4)
             else S.healthStatus = nil end
         elseif key == "lowhp" then
-            S.autoSpawnTP = {character = H.ready() and S.context.character or nil,
-                triggered = false, attempts = 0, retryAt = -math.huge}
+            S.autoSpawnTP = newAutoSpawnTPState(H.ready() and S.context.character or nil)
             if enabled then
                 H.notice("Auto TP armed: health at or below 30%", 4)
                 task.defer(function()
                     if not S.alive or not S.flags.lowhp then return end
                     local success, failure = pcall(H.tryAutoSpawnTP)
                     if not success then
-                        S.flags.lowhp = false
-                        H.updateSwitches()
                         H.report("Auto spawn TP", failure)
                     end
                 end)
@@ -6589,7 +6806,7 @@ function H.cleanupCharacter()
         if not ok then H.report("Character cleanup", message) end
     end
     S.context, S.idleTarget, S.idleSince, S.idleSample = nil, nil, nil, nil
-    S.autoSpawnTP = {character = nil, triggered = false, attempts = 0, retryAt = -math.huge}
+    S.autoSpawnTP = newAutoSpawnTPState(nil)
     S.idleBlockedUntil = -math.huge
     S.afkLastPulse, S.afkPulseUntil, S.afkPostPulseUntil = os.clock(), nil, -math.huge
     S.safeRoot, S.previousHealth = nil, nil
@@ -6604,6 +6821,7 @@ function H.cleanupCharacter()
     S.flingHoldTarget, S.flingSnapshot, S.flingLastStableCF = nil, nil, nil
     S.flingLastStableAt, S.flingPauseUntil, S.flingInputUntil = -math.huge, -math.huge, -math.huge
     S.flingRecovering = false
+    H.ringGuardReset()
     S.manualTeleportUntil, S.manualTeleportLastTarget = -math.huge, nil
     S.lockSuspended, S.escapeHold = false, nil
     S.lastChaseRelocate, S.lastChaseThreatAt = -math.huge, -math.huge
@@ -6645,8 +6863,8 @@ function H.beginCharacter(character)
             if instance:IsA("BasePart") then ctx.parts[instance] = true end
         end
         S.previousHealth = humanoid.Health
-        S.autoSpawnTP = {character = character, triggered = false,
-            attempts = 0, retryAt = -math.huge}
+        H.ringGuardReset()
+        S.autoSpawnTP = newAutoSpawnTPState(character)
         H.connect(character.DescendantAdded, function(instance)
             if S.context == ctx and instance:IsA("BasePart") then ctx.parts[instance] = true end
         end, S.characterConnections)
@@ -6689,6 +6907,13 @@ function H.beginCharacter(character)
                 H.notice("Waiting for respawn", 5)
                 return
             end
+            -- A threshold crossing must be checked regardless of whether
+            -- the last callback was categorized as damage or recovery.
+            if S.flags.lowhp and H.ready() then
+                local ok, returned = pcall(H.tryAutoSpawnTP, health)
+                if not ok then H.report("Auto spawn TP", returned)
+                elseif returned then return end
+            end
             if health < previous and not S.healing then
                 local now = os.clock()
                 local loss = previous - health
@@ -6702,12 +6927,7 @@ function H.beginCharacter(character)
                     end
                 end
                 table.insert(S.damageEvents, now)
-                -- Return to spawn takes priority over ordinary local damage evasion.
-                if S.flags.lowhp and H.ready() then
-                    local ok, returned = pcall(H.tryAutoSpawnTP, health)
-                    if not ok then H.report("Auto spawn TP", returned)
-                    elseif returned then return end
-                end
+                -- Auto spawn was already checked at the beginning of this event.
                 if S.flags.lock and H.ready() then
                     local threshold = math.max(Config.EmergencyMinDamageThreshold,
                         math.min(Config.EmergencyDamageAbsolute,
@@ -7582,6 +7802,7 @@ function H.physicsTick(deltaTime)
     H.applyCustomJump()
     H.applyCollision()
     H.updateFling("pre")
+    if S.flags.lock then H.guardLockImpulse("pre", deltaTime) end
     H.optionalFeature("afk",H.updateAFK,H.stopOptionalAFK)
     if S.flags.lock then
         H.updateLockWalking(deltaTime)
@@ -7630,6 +7851,10 @@ H.connect(RunService.PostSimulation, function(dt)
         local ok, message = pcall(H.updateFling, "post", dt)
         if not ok then H.report("Post-physics anti-fling", message) end
     end
+    if S.flags.lock and H.ready() then
+        local ok, message = pcall(H.guardLockImpulse, "post", dt)
+        if not ok then H.report("Post-physics Position Lock guard", message) end
+    end
     if S.flags.afk and S.idleTarget then
         local ok, message = pcall(H.guardAFKPosition)
         if not ok then H.report("AFK position guard", message) end
@@ -7650,8 +7875,10 @@ H.connect(RunService.Heartbeat, function(deltaTime)
     if S.flags.lowhp and H.ready() then
         local lowOk, lowErr = pcall(H.tryAutoSpawnTP)
         if not lowOk then
-            S.flags.lowhp = false
-            H.updateSwitches()
+            -- Leave the toggle armed; a transient API failure should not
+            -- permanently disable a recurring health safeguard.
+            local state = S.autoSpawnTP
+            if state then state.retryAt = os.clock() + Config.AutoSpawnTPMaxRetrySeconds end
             H.report("Auto spawn TP", lowErr)
         end
     end
@@ -7716,6 +7943,5 @@ H.connect(RunService.Heartbeat, function(deltaTime)
     end
     H.refreshStatus()
 end)
-
-H.updateSwitches()
-print("[GR33D v7.27] Moving-hazard fast defense + persistent threat hold loaded.")w
+H.updateSwitches(
+print("[GR33D v7.29] Fast hazards + repeatable 30% HP spawn TP + Position Lock anti-fling loaded.")
