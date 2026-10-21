@@ -1,4 +1,4 @@
--- GR33D Panel v7.26: latest defense base + low HP spawn TP + spectate + extreme motion watch
+-- GR33D Panel v7.27: prioritized moving-hazard sensing + persistent threat hold
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -19,31 +19,31 @@ end
 -- LocalScript utilities for games you control. Server physics/damage remains authoritative.
 local Config = {
     ScanInterval = 0.06, -- ~16 scans/second; HP response is immediate via HealthChanged
-    HazardScanInterval = 0.08, -- protection also runs before local physics
+    HazardScanInterval = 0.045, -- faster CFrame motion samples for tweened/grabbed objects
     HazardMotionMaxAge = 0.75,
-    HazardSweepMemory = 0.14,
+    HazardSweepMemory = 0.20,
     HazardMaxSampleSpeed = 3000,
     HazardMaxAcceleration = 450,
     HazardAccelerationHorizon = 0.35,
     HazardPredictionSteps = 6,
     UrgentImpactTime = 0.22,
-    UrgentRelocateCooldown = 0.08,
+    UrgentRelocateCooldown = 0.07,
     -- The urgent pass only runs while Position Lock is enabled. It scans nearby
     -- potential projectiles between normal hazard snapshots, never all of Workspace.
-    UrgentScanInterval = 0.05,
+    UrgentScanInterval = 0.035,
     UrgentScanRadius = 165,
-    UrgentScanMaxParts = 160,
+    UrgentScanMaxParts = 192,
     UrgentExtremeSpeed = 100, -- suspiciously fast; final impact test still required
-    UrgentCollisionTime = 0.42,
-    UrgentTeleportProximity = 18,
-    UrgentDestinationAttempts = 8,
+    UrgentCollisionTime = 0.6,
+    UrgentTeleportProximity = 26,
+    UrgentDestinationAttempts = 10,
     IndexBatchSize = 80,
     LockLocalScanInterval = 0.30, -- bounded local scan, no whole-map synchronous pass
     LockLocalScanRadius = 300,
     LockLocalScanMaxParts = 192,
     LockMaintenanceInterval = 0.20, -- refreshing every limb every frame caused unnecessary work
     -- Smart Shield is a proximity *sensor*, not another collidable physics body.
-    ShieldSenseInterval = 0.12,
+    ShieldSenseInterval = 0.08,
     ShieldSenseRadius = 120,
     ShieldSenseMaxParts = 150,
     ShieldSenseMinApproachSpeed = 30,
@@ -92,11 +92,11 @@ local Config = {
     MaxEscapeDistance = 65,
     -- Emergency tier: react to small real HP drops, or strongly abnormal
     -- motion/grabbing of nearby hazard parts. Keep normal small dodges separate.
-    EmergencyHeight = 100,
+    EmergencyHeight = 110,
     EmergencyMinDuration = 3.5,
-    EmergencyReturnQuiet = 2.6,
+    EmergencyReturnQuiet = 3.3,
     EmergencyRetriggerCooldown = 0.45,
-    EmergencyGuardRadius = 34,
+    EmergencyGuardRadius = 42,
     EmergencyProactiveRadiusCap = 45, -- ignore giant name-based danger radii
     EmergencyFastThreatSpeed = 65,
     EmergencySpinThreshold = 18,
@@ -108,10 +108,10 @@ local Config = {
     DamageBurstCount = 2,
     EmergencyHomeDangerHold = 1.4,
     ShieldDiameter = 8,
-    ChaseRelocateCooldown = 0.28, -- do not spin around every scan frame
-    ChaseGuardRadius = 27,
+    ChaseRelocateCooldown = 0.18, -- do not spin around every scan frame
+    ChaseGuardRadius = 36,
     ChaseQuietWindow = 1.1,
-    ChaseReturnQuiet = 4,
+    ChaseReturnQuiet = 5,
     ChaseHistoryDuration = 8,
     ChaseHistorySize = 10,
     ChaseMaxHeight = 650,
@@ -184,7 +184,8 @@ local Config = {
         "Lightning", "C4Bomb", "Meteor", "Deadzone", "Killzone", "Explosion",
         "Bomb", "Trap", "Lava"},
     -- These names identify candidate *parts*, not lethal proof or a damage radius.
-    ProjectileHints = {"magma", "lava", "meteor", "meteorite", "missile", "nuclearmissile",
+    ProjectileHints = {"magma", "lava", "moltenrock", "volcanomagma", "volcanolava",
+        "nuclearbomb", "radioactive", "radioactivewaste", "meteor", "meteorite", "missile", "nuclearmissile",
         "nuke", "nuclear", "rocket", "grenade", "bomb", "comet", "asteroid", "lightning",
         "fireball", "acid", "tsunamiwave", "tsunami", "tidalwave", "flashflood",
         "flood", "wave", "surge", "tornado", "twister", "cyclone", "hurricane", "warhead"},
@@ -197,15 +198,29 @@ local Config = {
     DefenseCorrectionCooldown = 0.75,
     DefenseDynamicMinSpeed = 32,
     DefenseMotionSampleLimit = 512,
-    DefenseHazardSampleBudget = 32,
+    DefenseHazardSampleBudget = 48,
     DefenseSnapshotLimit = 64,
     DefenseSnapshotInterval = 0.10,
     DefenseInfoInterval = 0.045,
     DefenseInfoLimit = 512,
     DefensePartBudget = 64,
     DefenseWidePartBudget = 32,
-    DefenseWorkSeconds = 0.0015,
+    DefenseWorkSeconds = 0.0025,
     DefenseEscapeSteerInterval = 0.12,
+    -- v7.27: short-range fast path for moving magma/nuclear and similarly marked hazards.
+    -- Names alone are NOT proof of a threat; motion/grab/confirmed damage required.
+    FastHazardInterval = 0.035,
+    FastHazardNearRadius = 48,
+    FastHazardFarRadius = 140,
+    FastHazardMaxParts = 240,
+    FastHazardCandidateBudget = 24,
+    FastHazardTrackLifetime = 2.0,
+    FastHazardTrackLimit = 40,
+    FastHazardNearGuard = 31,
+    FastHazardHomeGuard = 50,
+    FastHazardHomeQuiet = 4.5,
+    FastHazardHintTTL = 0.6,
+    FastHazardHomeProbeInterval = 0.18,
 }
 
 -- All state exists before callbacks capture it.
@@ -242,6 +257,10 @@ local S = {
     impactEntries = {}, recentHazard = nil,
     minimized = false, dragging = nil, suppressMinimizeUntil = -math.huge,
     defenseLog = {}, defenseMode = "normal", threatSignatures = {},
+    fastHazardTracked = {}, fastHazardLastScan = -math.huge,
+    fastHazardLastAt = -math.huge, fastHazardHomeAt = -math.huge,
+    fastHazardScanSerial = 0, fastHazardFarCursor = 1,
+    fastHazardHintCache = {}, fastHazardHomeProbeAt = -math.huge,
     shieldSenseAt = -math.huge, shieldSenseOverlap = nil,
     tsunamiProbeAt = -math.huge, tsunamiProbeOverlap = nil, tsunamiProbeInfo = nil,
     observers = {}, observerClock = 0, observingPlayer = nil, observingOriginalSubject = nil,
@@ -2537,7 +2556,15 @@ end
 
 function H.escapeClearance(target, records)
     local clearance = 180
-    for _, info in ipairs(records) do
+    local fastNow = os.clock()
+    -- The ordinary snapshot can be up to 0.1s old. Include fresh urgent sightings.
+    local allRecords = table.clone(records)
+    for part, entry in pairs(S.fastHazardTracked or {}) do
+        if part.Parent and entry.info and fastNow - entry.at <= Config.FastHazardTrackLifetime then
+            allRecords[#allRecords + 1] = entry.info
+        end
+    end
+    for _, info in ipairs(allRecords) do
         if H.threatAt(info, target.Position, Vector3.zero, false) then return nil end
         local steps = (info.acceleration or Vector3.zero).Magnitude > 1 and Config.HazardPredictionSteps or 1
         local from = target.Position
@@ -2589,12 +2616,16 @@ function H.urgentImpactEscape(threat)
     local home = S.escape and S.escape.home or S.lockTarget or current
     local orientation = current - current.Position
     local away, side = H.escapeDirections(threat, current)
-    local height = S.escape and 26 or Config.EmergencyHeight
-    local rise = Vector3.new(0, height, 0)
-    local offsets = {rise, rise + side * 25, rise - side * 25,
-        rise + away * 30, rise + away * 36 + side * 22,
-        rise + away * 36 - side * 22, rise - away * 25 + side * 24,
-        rise - away * 25 - side * 24}
+    -- Pursuing objects must not force a return or a tiny second-step vertical dodge.
+    local desiredY = math.max(current.Position.Y + (S.escape and 62 or Config.EmergencyHeight),
+        threat.bounds.Position.Y + threat.size.Y * 0.5 + threat.radius + 34)
+    local ceiling = home.Position.Y + Config.ChaseMaxHeight
+    local rise = Vector3.new(0, math.max(0, math.min(desiredY, ceiling) - current.Position.Y), 0)
+    local offsets = {rise + side * 28, rise - side * 28, rise,
+        rise + away * 38, rise - away * 38,
+        rise + away * 40 + side * 34, rise + away * 40 - side * 34,
+        rise - away * 34 + side * 34, rise - away * 34 - side * 34,
+        side * 65 + Vector3.new(0, 16, 0), -side * 65 + Vector3.new(0, 16, 0)}
     -- Capture the other known moving hazards once, not on each candidate.
     local known = H.hazardSnapshot()
     local checked = 0
@@ -2609,6 +2640,16 @@ function H.urgentImpactEscape(threat)
             if not unsafe then
                 for _, info in ipairs(known) do
                     if info.instance ~= threat.instance and H.threatAt(info, candidate.Position, Vector3.zero, false) then
+                        unsafe = true
+                        break
+                    end
+                end
+            end
+            if not unsafe then
+                for part, entry in pairs(S.fastHazardTracked or {}) do
+                    if part.Parent and entry.info and now - entry.at <= Config.FastHazardTrackLifetime
+                        and part ~= threat.instance
+                        and H.threatAt(entry.info, candidate.Position, Vector3.zero, false) then
                         unsafe = true
                         break
                     end
@@ -2648,6 +2689,160 @@ function H.urgentRawOnCourse(position, part, velocity, observerVelocity, horizon
     return miss.Magnitude <= part.Size.Magnitude * 0.5 + Config.HazardMargin + 4
 end
 
+-- Prioritized narrow sensor. Unlike general indexing, this inspects likely lethal
+-- candidates immediately, without waiting for a 160-part rotating cursor.
+-- It never assumes a nearby object is harmful solely because of its name.
+-- Cache ancestor-name classification to avoid rebuilding token maps for every
+-- harmless wall on every urgent physics scan. Short TTL allows renamed hazards.
+function H.fastHazardNameCandidate(part)
+    local now = os.clock()
+    S.fastHazardHintCache = S.fastHazardHintCache or {}
+    local cached = S.fastHazardHintCache[part]
+    if cached and now < cached.untilAt and cached.parent == part.Parent
+        and cached.name == part.Name then return cached.value end
+    local value = H.projectileHintInTree(part)
+    S.fastHazardHintCache[part] = {untilAt = now + Config.FastHazardHintTTL,
+        parent = part.Parent, name = part.Name, value = value}
+    return value
+end
+
+function H.fastHazardProbe()
+    if not S.flags.lock or not H.ready() then return nil end
+    local now = os.clock()
+    if now - (S.fastHazardLastScan or -math.huge) < Config.FastHazardInterval then return nil end
+    S.fastHazardLastScan = now
+    S.fastHazardScanSerial = (S.fastHazardScanSerial or 0) + 1
+    S.fastHazardTracked = S.fastHazardTracked or {}
+    local root = S.context.root
+    local observer = H.protectionObserverVelocity(root.Position)
+    local best, bestRank = nil, math.huge
+    local seen = {}
+    local trackedCount = 0
+    local function assess(part, fromMemory)
+        if seen[part] or not part or not part.Parent or not part:IsA("BasePart") then return end
+        seen[part] = true
+        if part:IsDescendantOf(S.context.character) then return end
+        -- Explicit classification and hazardous ancestor names, never a blanket
+        -- "volcano" match (which would flag stationary map scenery).
+        local named = H.fastHazardNameCandidate(part)
+        local certified = part:GetAttribute("Lethal") == true or part:GetAttribute("KillZone") == true
+            or (H.finite(part:GetAttribute("Damage")) and part:GetAttribute("Damage") > 0)
+            or H.hasTag(part, Config.ConfirmedHazardTags)
+        local known = S.fastHazardTracked[part]
+        if not named and not certified and not known then return end
+        local ok, info = pcall(H.hazardInfo, part)
+        if not ok or not info then return end
+        local present = H.boxDistance(root.Position, info.bounds, info.size) - info.radius
+        local motionEvidence = info.grabbed or info.moving or info.spinning or info.teleported
+            or info.erratic or info.recentlyMoved or info.active
+        if not motionEvidence and not (info.explicit and present < Config.HazardMargin + 3) then
+            return
+        end
+        S.fastHazardTracked[part] = {at = now, info = info}
+        local home = S.escape and S.escape.home
+        if home and H.boxDistance(home.Position, info.bounds, info.size) - info.radius
+                < Config.FastHazardHomeGuard then
+            S.fastHazardHomeAt = now
+            S.escape.safeSince = nil
+        end
+        local danger, _, impact = H.threatAt(info, root.Position, observer, true)
+        local closeGrab = (info.grabbed or info.teleported or info.erratic)
+            and present <= Config.FastHazardNearGuard
+        local closeMoving = (info.moving or info.spinning)
+            and present <= Config.HazardMargin + 7
+        if danger or closeGrab or closeMoving then
+            S.fastHazardLastAt = now
+            local rank = (closeGrab or closeMoving) and 0 or impact
+            if rank < bestRank then
+                best, bestRank = table.clone(info), rank
+                best.impactTime = rank
+            end
+        end
+    end
+    -- Revisit recently seen fast hazards first: rotating Workspace queries may
+    -- otherwise lose a ringed part among walls and decorations.
+    for part, entry in pairs(S.fastHazardTracked) do
+        if not part.Parent or now - entry.at > Config.FastHazardTrackLifetime then
+            S.fastHazardTracked[part] = nil
+        elseif trackedCount < Config.FastHazardTrackLimit then
+            trackedCount += 1
+            assess(part, true)
+        end
+    end
+    local params = S.fastHazardOverlap
+    if not params then
+        params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        S.fastHazardOverlap = params
+    end
+    params.FilterDescendantsInstances = {S.context.character}
+    params.MaxParts = Config.FastHazardMaxParts
+    -- Tight local scan every pass. Broader approach scan every second pass.
+    local useFar = S.fastHazardScanSerial % 2 == 0
+    local radius = useFar and Config.FastHazardFarRadius or Config.FastHazardNearRadius
+    local ok, parts = pcall(function()
+        return Workspace:GetPartBoundsInRadius(root.Position, radius, params)
+    end)
+    if ok then
+        local count = #parts
+        local cursor = count > 0 and ((S.fastHazardFarCursor or 1) - 1) % count + 1 or 1
+        local inspectedCandidates = 0
+        for offset = 0, count - 1 do
+            local part = parts[(cursor + offset - 1) % count + 1]
+            if part:IsA("BasePart") and not seen[part] then
+                local named = H.fastHazardNameCandidate(part)
+                if named or part:GetAttribute("Lethal") == true or part:GetAttribute("KillZone") == true
+                    or part:GetAttribute("Damage") ~= nil then
+                    inspectedCandidates += 1
+                    assess(part)
+                end
+            end
+            if inspectedCandidates >= Config.FastHazardCandidateBudget then break end
+        end
+        S.fastHazardFarCursor = count > 0 and cursor % count + 1 or 1
+    end
+    -- Also assess the intended return location while we are far above it.
+    -- Otherwise the ring could linger on the ground and be missed entirely.
+    local home = S.escape and S.escape.home
+    if home and (root.Position - home.Position).Magnitude > Config.FastHazardFarRadius * 0.75
+        and now - (S.fastHazardHomeProbeAt or -math.huge) >= Config.FastHazardHomeProbeInterval then
+        S.fastHazardHomeProbeAt = now
+        params.MaxParts = 130
+        local homeOK, homeParts = pcall(function()
+            return Workspace:GetPartBoundsInRadius(home.Position, Config.FastHazardHomeGuard, params)
+        end)
+        if homeOK then
+            local inspected = 0
+            for _, part in ipairs(homeParts) do
+                if part:IsA("BasePart") and not seen[part] and
+                    (H.fastHazardNameCandidate(part) or part:GetAttribute("Lethal") == true
+                        or part:GetAttribute("Damage") ~= nil) then
+                    assess(part)
+                    inspected += 1
+                    if inspected >= 12 then break end
+                end
+            end
+        end
+    end
+    -- Evict older tracked entries if the game is spawning many different hazards.
+    if S.fastHazardScanSerial % 60 == 0 then
+        for part, record in pairs(S.fastHazardHintCache) do
+            if not part.Parent or now - record.untilAt > 3 then
+                S.fastHazardHintCache[part] = nil
+            end
+        end
+    end
+    local total, oldestPart, oldestAt = 0, nil, math.huge
+    for part, entry in pairs(S.fastHazardTracked) do
+        total += 1
+        if entry.at < oldestAt then oldestPart, oldestAt = part, entry.at end
+    end
+    if total > Config.FastHazardTrackLimit and oldestPart then
+        S.fastHazardTracked[oldestPart] = nil
+    end
+    return best
+end
+
 -- Extra hazard query only runs when Position Lock is active. This is bounded
 -- and independently throttled, so the normal panel features keep their cadence.
 function H.urgentImpactProbe()
@@ -2656,10 +2851,16 @@ function H.urgentImpactProbe()
     if not S.defenseManualInspection and (now < S.manualTeleportUntil or (S.escape and S.escape.mode == "manual")) then return false end
     if now - (S.urgentLastScan or -math.huge) < Config.UrgentScanInterval then return false end
     S.urgentLastScan = now
+    local checked, prioritized = pcall(H.fastHazardProbe)
+    if not checked then
+        H.report("Prioritized hazard sensor", prioritized)
+    elseif prioritized and H.urgentImpactEscape(prioritized) then return true end
     local position = S.context.root.Position
     local observer = H.protectionObserverVelocity(position)
     local imminent, closestTime = nil, math.huge
-    for _, info in ipairs(H.defenseProbeRecords()) do
+    local inputs = table.clone(H.defenseProbeRecords())
+    for _, info in ipairs(S.defenseSnapshotCache or {}) do inputs[#inputs + 1] = info end
+    for _, info in ipairs(inputs) do
                 local gap = H.boxDistance(position, info.bounds, info.size) - info.radius
                 local contact = gap <= Config.HazardMargin + 2 and (info.explicit or info.grabbed or info.moving)
                 local jumpedNear = info.teleported and gap <= Config.UrgentTeleportProximity
@@ -3508,6 +3709,13 @@ function H.updateEscape()
         end
     end
     if not S.escape then return end
+    -- Require a quiet period after repeated rapid magma/nuclear encounters.
+    -- The client can only assess replicated movement, not server-side damage.
+    if now - (S.fastHazardHomeAt or -math.huge) < Config.FastHazardHomeQuiet
+        or now - (S.fastHazardLastAt or -math.huge) < Config.EmergencyReturnQuiet then
+        S.escape.safeSince = nil
+        return
+    end
     if now < S.escape.earliestReturn then return end
     -- Cannot safely re-arm while a hazard is still following the airborne rig.
     local persistent = (S.escape.chaseCount or 0) >= 2
@@ -5912,6 +6120,10 @@ end
 
 function H.primeHazardIndex()
     S.urgentLastScan, S.urgentLastMove = -math.huge, -math.huge
+    S.fastHazardTracked, S.fastHazardOverlap = {}, nil
+    S.fastHazardLastScan, S.fastHazardLastAt, S.fastHazardHomeAt = -math.huge, -math.huge, -math.huge
+    S.fastHazardScanSerial, S.fastHazardFarCursor = 0, 1
+    S.fastHazardHintCache, S.fastHazardHomeProbeAt = {}, -math.huge
     S.urgentOverlap = nil
     S.tsunamiProbeAt, S.tsunamiProbeInfo, S.tsunamiProbeOverlap = -math.huge, nil, nil
     S.shieldSenseAt, S.shieldSenseOverlap = -math.huge, nil
@@ -6398,6 +6610,10 @@ function H.cleanupCharacter()
     S.escapeHistory, S.hazardCache = {}, nil
     S.lastProtectionScanAt = -math.huge
     S.urgentLastScan, S.urgentLastMove = -math.huge, -math.huge
+    S.fastHazardTracked, S.fastHazardOverlap = {}, nil
+    S.fastHazardLastScan, S.fastHazardLastAt, S.fastHazardHomeAt = -math.huge, -math.huge, -math.huge
+    S.fastHazardScanSerial, S.fastHazardFarCursor = 0, 1
+    S.fastHazardHintCache, S.fastHazardHomeProbeAt = {}, -math.huge
     S.urgentOverlap = nil
 end
 
@@ -7502,4 +7718,4 @@ H.connect(RunService.Heartbeat, function(deltaTime)
 end)
 
 H.updateSwitches()
-print("[GR33D v7.26] Latest defensive base + low-HP spawn + spectate + extreme-physics watch loaded.")
+print("[GR33D v7.27] Moving-hazard fast defense + persistent threat hold loaded.")w
