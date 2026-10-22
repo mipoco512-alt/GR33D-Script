@@ -7943,5 +7943,5 @@ H.connect(RunService.Heartbeat, function(deltaTime)
     end
     H.refreshStatus()
 end)
-H.updateSwitches(
+H.updateSwitches()
 print("[GR33D v7.29] Fast hazards + repeatable 30% HP spawn TP + Position Lock anti-fling loaded.")
