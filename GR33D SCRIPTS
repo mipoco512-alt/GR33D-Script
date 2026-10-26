@@ -1,3 +1,5 @@
+-- GR33D Panel v7.29 - floating G button visibility repair.
+-- Only the panel minimize / maximize UI is changed; other systems are retained.
 -- GR33D Panel v7.29: fast hazards + repeatable low-HP spawn TP + pre/post physics fling protection
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -448,6 +450,14 @@ function H.refreshStatus()
     if S.ui.status.TextColor3~=color then S.ui.status.TextColor3=color end
     if S.ui.statusDetail and S.ui.statusDetail.Text~=detail then S.ui.statusDetail.Text=detail end
     if S.ui.statusDot then S.ui.statusDot.BackgroundColor3=color end
+    if S.ui.minimizeDot then
+        local anyEnabled = false
+        for _, enabled in pairs(S.flags) do
+            if enabled then anyEnabled = true; break end
+        end
+        S.ui.minimizeDot.BackgroundColor3 = anyEnabled and Color3.fromRGB(65, 226, 174)
+            or Color3.fromRGB(169, 189, 196)
+    end
 end
 
 -- In-memory recorder; no uploads, no automated player reports or punitive actions.
@@ -7219,7 +7229,8 @@ function H.layout()
     S.ui.statusDetail.TextTruncate = Enum.TextTruncate.AtEnd
     S.ui.statusDot.Position = UDim2.fromOffset(12, 11)
     S.ui.statusDot.Size = UDim2.fromOffset(6, 6)
-    S.ui.minimizeCorner.CornerRadius = UDim.new(0, show and 9 or 28)
+    -- Rounded square for the floating G; never crop the 30px label.
+    S.ui.minimizeCorner.CornerRadius = UDim.new(0, show and 10 or 16)
     S.ui.title.Text = width < 300 and "GR33D" or "GR33D CONTROL"
     S.ui.title.TextSize = showTagline and 18 or 17
     S.ui.title.Position = UDim2.fromOffset(24, showTagline and 7 or 11)
@@ -7232,8 +7243,15 @@ function H.layout()
     S.ui.close.Position = UDim2.new(1, -52, 0, controlTop)
     S.ui.minimize.Size = show and UDim2.fromOffset(44, 44) or UDim2.fromScale(1, 1)
     S.ui.minimize.Position = show and UDim2.new(1, -100, 0, controlTop) or UDim2.fromOffset(0, 0)
-    S.ui.minimize.Text = show and "−" or "G"
-    S.ui.minimize.BackgroundColor3 = show and Color3.fromRGB(38, 52, 60) or Color3.fromRGB(26, 79, 70)
+    -- Use the independent TextLabel; button text stays disabled permanently.
+    S.ui.minimize.Text = ""
+    S.ui.minimizeGlyph.Text = show and "−" or "G"
+    S.ui.minimizeGlyph.TextSize = show and 27 or 30
+    S.ui.minimizeGlyph.TextColor3 = Color3.fromRGB(255, 255, 255)
+    S.ui.minimizeDot.Visible = not show
+    S.ui.minimizeStroke.Color = show and UI.border or UI.accent
+    S.ui.minimize.BackgroundColor3 = show and Color3.fromRGB(38, 52, 60)
+        or Color3.fromRGB(18, 54, 52)
     H.revealUITab(S.ui.activeTab)
     H.refreshStatus()
 end
@@ -7343,10 +7361,41 @@ S.ui.tagline = H.make("TextLabel", {Position = UDim2.fromOffset(25, 35), Size = 
     Text = "ADAPTIVE DEFENSE / CONTROL CENTER", BackgroundTransparency = 1,
     TextSize = 9, TextColor3 = Color3.fromRGB(176, 207, 209),
     TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamMedium}, S.ui.header)
-S.ui.minimize = H.make("TextButton", {Text = "−", AutoButtonColor = true,
-    TextColor3 = UI.text, TextSize = 23, Font = Enum.Font.GothamBold,
-    BackgroundColor3 = Color3.fromRGB(43, 54, 70)}, S.ui.panel)
-S.ui.minimizeCorner = H.corner(S.ui.minimize, 9)
+-- Readable minimize / floating maximize control. The button itself never
+-- renders text: a separate centered label prevents Roblox button-text cropping.
+-- Keep the original button so all drag/tap handlers still work.
+S.ui.minimize = H.make("TextButton", {
+    Name = "FloatingGMaximize", Text = "", AutoButtonColor = false,
+    TextTransparency = 1, TextSize = 1,
+    BackgroundColor3 = Color3.fromRGB(43, 54, 70),
+    Active = true, Selectable = true, ZIndex = 10,
+}, S.ui.panel)
+S.ui.minimizeCorner = H.corner(S.ui.minimize, 10)
+S.ui.minimizeStroke = H.make("UIStroke", {
+    Name = "GOutline", Color = UI.border, Thickness = 1.6,
+    Transparency = 0.06, ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, S.ui.minimize)
+H.make("UIGradient", {Name = "GBackgroundGradient", Rotation = 90,
+    Color = ColorSequence.new(
+        Color3.fromRGB(31, 59, 62), Color3.fromRGB(12, 27, 34))
+}, S.ui.minimize)
+S.ui.minimizeGlyph = H.make("TextLabel", {
+    Name = "CenteredGLetter", Text = "G", BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(0, 0), Size = UDim2.fromScale(1, 1),
+    TextColor3 = Color3.fromRGB(255, 255, 255),
+    Font = Enum.Font.GothamBold, TextSize = 30, TextScaled = false,
+    TextWrapped = false, TextXAlignment = Enum.TextXAlignment.Center,
+    TextYAlignment = Enum.TextYAlignment.Center,
+    TextStrokeTransparency = 0.82, Active = false, Selectable = false,
+    ZIndex = 11,
+}, S.ui.minimize)
+S.ui.minimizeDot = H.make("Frame", {
+    Name = "FeatureStatusDot", BackgroundColor3 = UI.muted,
+    Position = UDim2.new(1, -14, 0, 7),
+    Size = UDim2.fromOffset(7, 7), Visible = false,
+    Active = false, ZIndex = 12,
+}, S.ui.minimize)
+H.corner(S.ui.minimizeDot, 4)
 S.ui.close = H.make("TextButton", {Size = UDim2.fromOffset(30, 30),
     Position = UDim2.new(1, -39, 0, 17), Text = "×", BackgroundColor3 = Color3.fromRGB(96, 49, 61),
     TextColor3 = UI.text, TextSize = 19, Font = Enum.Font.GothamBold}, S.ui.panel)
